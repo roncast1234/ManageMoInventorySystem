@@ -1,0 +1,699 @@
+<?php
+$page_title = 'Manage Users';
+require_once dirname(__DIR__) . '/config/functions.php';
+
+requireAdmin();
+
+$current_user = getCurrentUser();
+$action = $_GET['action'] ?? 'list';
+
+// Handle POST actions
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    startSession();
+    $post_action = sanitizeInput($_POST['action'] ?? '');
+
+    if ($post_action === 'add_user') {
+        $full_name  = sanitizeInput($_POST['full_name'] ?? '');
+        $email      = sanitizeInput($_POST['email'] ?? '');
+        $phone      = sanitizeInput($_POST['phone'] ?? '');
+        $role       = sanitizeInput($_POST['role'] ?? 'user');
+        // The merged Campus/College/Office picker writes its value to college_id.
+        // campus_id no longer exists as a column at all — don't send it.
+        $college_id = sanitizeInput($_POST['college_id'] ?? '');
+        $password   = $_POST['password'] ?? '';
+        $confirm    = $_POST['confirm_password'] ?? '';
+
+        $errors = [];
+        if (!$full_name) $errors[] = 'Full name is required.';
+        if (!$email || !filter_var($email, FILTER_VALIDATE_EMAIL)) $errors[] = 'Valid email is required.';
+        if (strlen($password) < 6) $errors[] = 'Password must be at least 6 characters.';
+        if ($password !== $confirm) $errors[] = 'Passwords do not match.';
+
+        foreach (getUsers() as $u) {
+            if (strtolower($u['email']) === strtolower($email)) {
+                $errors[] = 'Email already exists.';
+                break;
+            }
+        }
+
+        if (empty($errors)) {
+            $new_user = dbCreateUser([
+                'email'      => $email,
+                'password'   => hashPassword($password),
+                'full_name'  => $full_name,
+                'role'       => in_array($role, ['admin','user']) ? $role : 'user',
+                'college_id' => $college_id ?: null,
+                'phone'      => $phone,
+                'is_active'  => 1,
+            ]);
+            $new_id = $new_user['id'] ?? 0;
+            logActivity($current_user['id'], 'CREATE', "Added new user: $email", 'users', $new_id);
+            redirectWithMessage('users.php', 'User added successfully!', 'success');
+        } else {
+            startSession();
+            $_SESSION['user_form_errors'] = $errors;
+            $_SESSION['user_form_data']   = $_POST;
+            redirectWithMessage('users.php?action=add', implode(' ', $errors), 'danger');
+        }
+
+    } elseif ($post_action === 'toggle_status') {
+        $uid    = (int)($_POST['user_id'] ?? 0);
+        $target = findById(getUsers(), $uid);
+        if ($target) {
+            $new_active = $target['is_active'] ? 0 : 1;
+            dbUpdateUser($uid, ['is_active' => $new_active]);
+            $label = $new_active ? 'activated' : 'deactivated';
+            logActivity($current_user['id'], 'UPDATE', "User #$uid $label", 'users', $uid);
+            redirectWithMessage('users.php', 'User ' . $label . '.', 'success');
+        }
+
+    } elseif ($post_action === 'edit_user') {
+        $uid        = (int)($_POST['user_id'] ?? 0);
+        $target     = findById(getUsers(), $uid);
+        $full_name  = sanitizeInput($_POST['full_name'] ?? '');
+        $email      = sanitizeInput($_POST['email'] ?? '');
+        $phone      = sanitizeInput($_POST['phone'] ?? '');
+        $role       = sanitizeInput($_POST['role'] ?? 'user');
+        // The merged Campus/College/Office picker writes its value to college_id.
+        // campus_id no longer exists as a column at all — don't send it.
+        $college_id = sanitizeInput($_POST['college_id'] ?? '');
+        $password   = $_POST['password'] ?? '';
+        $confirm    = $_POST['confirm_password'] ?? '';
+
+        $errors = [];
+        if (!$target) $errors[] = 'User not found.';
+        if (!$full_name) $errors[] = 'Full name is required.';
+        if (!$email || !filter_var($email, FILTER_VALIDATE_EMAIL)) $errors[] = 'Valid email is required.';
+        foreach (getUsers() as $u) {
+            if ($u['id'] != $uid && strtolower($u['email']) === strtolower($email)) {
+                $errors[] = 'Email already in use by another account.';
+                break;
+            }
+        }
+        if ($password !== '' || $confirm !== '') {
+            if (strlen($password) < 6) $errors[] = 'New password must be at least 6 characters.';
+            if ($password !== $confirm) $errors[] = 'Passwords do not match.';
+        }
+        // Prevent an admin from demoting/locking themselves out by accident
+        if ($target && $uid === $current_user['id'] && $role !== 'admin') {
+            $errors[] = 'You cannot remove your own admin role.';
+        }
+
+        if (empty($errors)) {
+            $update = [
+                'full_name'  => $full_name,
+                'email'      => $email,
+                'phone'      => $phone,
+                'role'       => in_array($role, ['admin', 'user']) ? $role : 'user',
+                'college_id' => $college_id ?: null,
+            ];
+            if ($password !== '') $update['password'] = hashPassword($password);
+            dbUpdateUser($uid, $update);
+            logActivity($current_user['id'], 'UPDATE', "Updated user account: $email", 'users', $uid);
+            redirectWithMessage('users.php', 'User updated successfully!', 'success');
+        } else {
+            startSession();
+            $_SESSION['user_form_errors'] = $errors;
+            $_SESSION['user_form_data']   = $_POST;
+            redirectWithMessage('users.php?action=edit&id=' . $uid, implode(' ', $errors), 'danger');
+        }
+
+    } elseif ($post_action === 'delete_user') {
+        $uid    = (int)($_POST['user_id'] ?? 0);
+        $target = findById(getUsers(), $uid);
+        if (!$target) {
+            redirectWithMessage('users.php', 'User not found.', 'danger');
+        }
+        if ($uid === $current_user['id']) {
+            redirectWithMessage('users.php', 'You cannot delete your own account.', 'danger');
+        }
+        // Full delete: also remove this user's requests/borrow records/owned items so
+        // nothing is left pointing at a now-deleted account (no "Unknown User" rows).
+        $db = supabase();
+        $del_requests    = $db->delete('requests', 'user_id=eq.' . $uid);
+        $del_borrows     = $db->delete('borrow_records', 'user_id=eq.' . $uid);
+        $del_owned_items = $db->delete('user_owned_items', 'user_id=eq.' . $uid);
+        clearDataCache('requests', 'borrow_records', 'user_owned_items');
+        dbDeleteUser($uid);
+        $cascade_note = sprintf(
+            ' (also removed %d request(s), %d borrow record(s), %d owned item(s))',
+            count($del_requests), count($del_borrows), count($del_owned_items)
+        );
+        logActivity($current_user['id'], 'DELETE', "Deleted user account: {$target['email']}$cascade_note", 'users', $uid);
+        redirectWithMessage('users.php', 'User and all associated records deleted.', 'success');
+    }
+}
+
+$all_users = getUsers();
+$all_department_names = getAllDepartmentNames(); // includes campuses, for display lookups
+
+require_once dirname(__DIR__) . '/includes/header.php';
+require_once dirname(__DIR__) . '/includes/navbar.php';
+?>
+<div class="main-wrapper">
+<?php displayMessage(); ?>
+
+<style>
+/* ===== USER MANAGEMENT ===== */
+:root { --um-red:#8B0000; --um-red2:#b91c1c; }
+
+/* Stats row */
+.um-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-bottom:22px; }
+@media(max-width:576px){ .um-stats { grid-template-columns:1fr; } }
+.um-stat-card {
+    background:#fff;
+    border:1px solid #e5e7eb; border-radius:8px;
+    box-shadow:0 1px 4px rgba(0,0,0,0.06);
+    padding:18px 20px; display:flex; align-items:center; gap:14px;
+}
+.um-stat-icon {
+    width:36px; height:36px; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; font-size:1.1rem;
+}
+.um-stat-val { font-size:1.55rem; font-weight:900; line-height:1; color:#1a1d23; }
+.um-stat-lbl { font-size:0.74rem; font-weight:700; color:rgba(0,0,0,0.40); text-transform:uppercase; letter-spacing:0.4px; margin-top:2px; }
+
+/* Header bar */
+.um-header {
+    display:flex; align-items:center; justify-content:space-between;
+    flex-wrap:wrap; gap:12px; margin-bottom:20px;
+}
+.um-header-title { font-size:1.05rem; font-weight:800; color:#1a1d23; }
+.um-header-sub   { font-size:0.78rem; color:rgba(0,0,0,0.40); margin-top:1px; }
+
+/* User card grid */
+.um-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:16px; }
+
+.um-user-card {
+    background:#fff;
+    border:1px solid #e5e7eb; border-radius:8px;
+    box-shadow:0 1px 4px rgba(0,0,0,0.06);
+    padding:20px; display:flex; flex-direction:column; gap:14px;
+}
+.um-user-card:hover { border-color:#d1d5db; }
+
+.um-card-top { display:flex; align-items:flex-start; gap:13px; }
+.um-avatar {
+    width:46px; height:46px; border-radius:8px; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center;
+    font-weight:900; font-size:1.05rem; color:#fff;
+}
+.um-card-name { font-size:0.93rem; font-weight:800; color:#1a1d23; line-height:1.2; }
+.um-card-email { font-size:0.76rem; color:rgba(0,0,0,0.45); margin-top:2px; word-break:break-all; }
+.um-card-phone { font-size:0.75rem; color:rgba(0,0,0,0.38); margin-top:1px; }
+
+.um-card-meta {
+    display:flex; flex-wrap:wrap; gap:6px;
+    padding:10px 12px; background:rgba(0,0,0,0.025);
+    border-radius:10px;
+}
+.um-card-meta-item {
+    display:flex; align-items:center; gap:5px;
+    font-size:0.75rem; color:rgba(0,0,0,0.50);
+}
+.um-card-meta-item i { width:13px; text-align:center; color:rgba(0,0,0,0.30); }
+
+.um-card-footer {
+    display:flex; align-items:center; justify-content:space-between;
+    padding-top:12px; border-top:1px solid rgba(0,0,0,0.06);
+}
+.um-card-joined { font-size:0.73rem; color:rgba(0,0,0,0.35); }
+
+/* Badges */
+.um-badge {
+    display:inline-flex; align-items:center; gap:4px;
+    padding:3px 10px; border-radius:4px;
+    font-size:0.72rem; font-weight:700;
+}
+.um-badge-admin   { background:rgba(139,0,0,0.10); color:#8B0000; }
+.um-badge-user    { background:rgba(59,130,246,0.12); color:#1d4ed8; }
+.um-badge-active  { background:rgba(34,197,94,0.12);  color:#15803d; }
+.um-badge-inactive{ background:rgba(0,0,0,0.07);       color:rgba(0,0,0,0.45); }
+
+/* Buttons */
+.um-btn {
+    display:inline-flex; align-items:center; gap:5px;
+    padding:6px 14px; border-radius:6px; border:none;
+    font-size:0.78rem; font-weight:700; cursor:pointer;
+    text-decoration:none; transition:background 0.15s;
+}
+.um-btn-primary {
+    background:#8B0000;
+    color:#fff !important;
+}
+.um-btn-primary:hover { color:#fff !important; background:#6b0000; }
+.um-btn-secondary {
+    background:rgba(0,0,0,0.06); color:rgba(0,0,0,0.55) !important;
+    border:1px solid rgba(0,0,0,0.09);
+}
+.um-btn-secondary:hover { background:rgba(0,0,0,0.10); color:rgba(0,0,0,0.70) !important; }
+.um-btn-sm { padding:4px 11px; font-size:0.74rem; }
+.um-btn-toggle-on  { background:rgba(239,68,68,0.09); color:#dc2626 !important; border:1px solid rgba(239,68,68,0.18); }
+.um-btn-toggle-on:hover  { background:rgba(239,68,68,0.16); }
+.um-btn-toggle-off { background:rgba(34,197,94,0.09);  color:#15803d !important; border:1px solid rgba(34,197,94,0.18); }
+.um-btn-toggle-off:hover { background:rgba(34,197,94,0.16); }
+
+/* Form */
+.um-form-card {
+    background:#fff;
+    border:1px solid #e5e7eb; border-radius:8px;
+    box-shadow:0 1px 4px rgba(0,0,0,0.06);
+    padding:26px 28px; margin-bottom:16px;
+}
+.um-form-section {
+    font-size:0.69rem; font-weight:700; text-transform:uppercase;
+    letter-spacing:0.5px; color:rgba(0,0,0,0.35);
+    margin-bottom:16px; padding-bottom:9px;
+    border-bottom:1px solid rgba(0,0,0,0.07);
+    display:flex; align-items:center; gap:7px;
+}
+.um-form-section i { color:var(--um-red); font-size:0.80rem; }
+.um-form-label {
+    font-size:0.79rem; font-weight:700; color:#374151; margin-bottom:5px; display:block;
+}
+.um-form-req { color:#dc2626; margin-left:2px; }
+.um-tip-card {
+    background:#f7f7f7;
+    border:1px solid #e5e7eb; border-radius:8px;
+    padding:18px 20px;
+}
+.um-tip-item { display:flex; gap:10px; margin-bottom:12px; font-size:0.80rem; color:#374151; }
+.um-tip-item:last-child { margin-bottom:0; }
+.um-tip-dot { width:22px; height:22px; border-radius:4px; background:rgba(139,0,0,0.08); color:var(--um-red); display:flex; align-items:center; justify-content:center; flex-shrink:0; font-size:0.72rem; margin-top:1px; }
+</style>
+
+<div class="container-fluid mt-4 pb-4">
+
+<?php if ($action === 'add'): ?>
+    <!-- Add User Form -->
+    <div class="d-flex align-items-center gap-3 mb-4">
+        <a href="users.php" class="um-btn um-btn-secondary"><i class="fas fa-arrow-left"></i> Back</a>
+        <div>
+            <div style="font-size:1.05rem;font-weight:800;color:#1a1d23;">Add New User</div>
+            <div style="font-size:0.78rem;color:rgba(0,0,0,0.42);">Create a new system account</div>
+        </div>
+    </div>
+    <div class="row g-4">
+    <div class="col-lg-8">
+    <div class="um-form-card">
+        <div class="um-form-section"><i class="fas fa-id-card"></i> Personal Information</div>
+        <form method="POST" action="users.php">
+            <input type="hidden" name="action" value="add_user">
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <label class="um-form-label">Full Name <span class="um-form-req">*</span></label>
+                    <input type="text" class="form-control" name="full_name" required
+                        value="<?php echo htmlspecialchars($_SESSION['user_form_data']['full_name'] ?? ''); ?>">
+                </div>
+                <div class="col-md-6">
+                    <label class="um-form-label">Email Address <span class="um-form-req">*</span></label>
+                    <input type="email" class="form-control" name="email" required
+                        value="<?php echo htmlspecialchars($_SESSION['user_form_data']['email'] ?? ''); ?>">
+                </div>
+                <div class="col-md-6">
+                    <label class="um-form-label">Phone Number</label>
+                    <input type="text" class="form-control" name="phone" placeholder="e.g. 09171234567"
+                        value="<?php echo htmlspecialchars($_SESSION['user_form_data']['phone'] ?? ''); ?>">
+                </div>
+                <div class="col-md-6">
+                    <label class="um-form-label">Role <span class="um-form-req">*</span></label>
+                    <select class="form-select" name="role" id="roleSelect">
+                        <option value="user"  <?php echo (($_SESSION['user_form_data']['role'] ?? 'user') === 'user')  ? 'selected' : ''; ?>>Faculty / Staff</option>
+                        <option value="admin" <?php echo (($_SESSION['user_form_data']['role'] ?? '') === 'admin') ? 'selected' : ''; ?>>Administrator</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="um-form-section mt-4"><i class="fas fa-building"></i> Campus &amp; Department</div>
+            <div class="row g-3">
+                <div class="col-md-6" id="collegeFieldWrap">
+                    <label class="um-form-label">Campus / College / Office</label>
+                    <select class="form-select" name="college_id">
+                        <option value="">— None —</option>
+                        <?php renderDepartmentOptionGroups($_SESSION['user_form_data']['college_id'] ?? null); ?>
+                    </select>
+                </div>
+            </div>
+
+            <div class="um-form-section mt-4"><i class="fas fa-lock"></i> Account Security</div>
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <label class="um-form-label">Password <span class="um-form-req">*</span></label>
+                    <input type="password" class="form-control" name="password" required minlength="6" placeholder="Min. 6 characters">
+                </div>
+                <div class="col-md-6">
+                    <label class="um-form-label">Confirm Password <span class="um-form-req">*</span></label>
+                    <input type="password" class="form-control" name="confirm_password" required minlength="6">
+                </div>
+            </div>
+
+            <div class="d-flex gap-2 mt-4">
+                <button type="submit" class="um-btn um-btn-primary" style="padding:10px 24px;font-size:0.87rem;">
+                    <i class="fas fa-user-plus"></i> Create User
+                </button>
+                <a href="users.php" class="um-btn um-btn-secondary" style="padding:10px 20px;font-size:0.87rem;">Cancel</a>
+            </div>
+        </form>
+    </div>
+    </div>
+
+    <!-- Tips sidebar -->
+    <div class="col-lg-4">
+        <div class="um-tip-card">
+            <div style="font-size:0.78rem;font-weight:800;color:#8B0000;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:14px;">
+                <i class="fas fa-lightbulb me-1"></i> Guidelines
+            </div>
+            <div class="um-tip-item">
+                <div class="um-tip-dot"><i class="fas fa-envelope"></i></div>
+                <div>Use the user's official <strong>university email</strong> address for their account.</div>
+            </div>
+            <div class="um-tip-item">
+                <div class="um-tip-dot"><i class="fas fa-lock"></i></div>
+                <div>Passwords must be <strong>at least 6 characters</strong>. Share credentials securely.</div>
+            </div>
+            <div class="um-tip-item">
+                <div class="um-tip-dot"><i class="fas fa-user-shield"></i></div>
+                <div><strong>Admin</strong> accounts have full system access. Assign with care.</div>
+            </div>
+            <div class="um-tip-item">
+                <div class="um-tip-dot"><i class="fas fa-building"></i></div>
+                <div>Department / Office applies to any user.</div>
+            </div>
+        </div>
+    </div>
+    </div>
+    <?php unset($_SESSION['user_form_errors'], $_SESSION['user_form_data']); ?>
+
+<?php elseif ($action === 'edit'):
+    $edit_id   = (int)($_GET['id'] ?? 0);
+    $edit_user = findById($all_users, $edit_id);
+    if (!$edit_user) { die('<div class="alert alert-danger">User not found</div>'); }
+    $fd = $_SESSION['user_form_data'] ?? $edit_user; // repopulate from failed submit, else the DB row
+?>
+    <!-- Edit User Form -->
+    <div class="d-flex align-items-center gap-3 mb-4">
+        <a href="users.php" class="um-btn um-btn-secondary"><i class="fas fa-arrow-left"></i> Back</a>
+        <div>
+            <div style="font-size:1.05rem;font-weight:800;color:#1a1d23;">Edit User</div>
+            <div style="font-size:0.78rem;color:rgba(0,0,0,0.42);"><?php echo htmlspecialchars($edit_user['email']); ?></div>
+        </div>
+    </div>
+    <div class="row g-4">
+    <div class="col-lg-8">
+    <div class="um-form-card">
+        <div class="um-form-section"><i class="fas fa-id-card"></i> Personal Information</div>
+        <form method="POST" action="users.php">
+            <input type="hidden" name="action" value="edit_user">
+            <input type="hidden" name="user_id" value="<?php echo $edit_user['id']; ?>">
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <label class="um-form-label">Full Name <span class="um-form-req">*</span></label>
+                    <input type="text" class="form-control" name="full_name" required
+                        value="<?php echo htmlspecialchars($fd['full_name'] ?? ''); ?>">
+                </div>
+                <div class="col-md-6">
+                    <label class="um-form-label">Email Address <span class="um-form-req">*</span></label>
+                    <input type="email" class="form-control" name="email" required
+                        value="<?php echo htmlspecialchars($fd['email'] ?? ''); ?>">
+                </div>
+                <div class="col-md-6">
+                    <label class="um-form-label">Phone Number</label>
+                    <input type="text" class="form-control" name="phone" placeholder="e.g. 09171234567"
+                        value="<?php echo htmlspecialchars($fd['phone'] ?? ''); ?>">
+                </div>
+                <div class="col-md-6">
+                    <label class="um-form-label">Role <span class="um-form-req">*</span></label>
+                    <select class="form-select" name="role" id="roleSelect"
+                            <?php echo $edit_user['id'] === $current_user['id'] ? 'disabled' : ''; ?>>
+                        <option value="user"  <?php echo (($fd['role'] ?? 'user') === 'user')  ? 'selected' : ''; ?>>Faculty / Staff</option>
+                        <option value="admin" <?php echo (($fd['role'] ?? '') === 'admin') ? 'selected' : ''; ?>>Administrator</option>
+                    </select>
+                    <?php if ($edit_user['id'] === $current_user['id']): ?>
+                    <input type="hidden" name="role" value="admin">
+                    <div class="form-text">You can't change your own role.</div>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <div class="um-form-section mt-4"><i class="fas fa-building"></i> Department</div>
+            <div class="row g-3">
+                <div class="col-md-6" id="collegeFieldWrap">
+                    <label class="um-form-label">Campus / College / Office</label>
+                    <select class="form-select" name="college_id">
+                        <option value="">— None —</option>
+                        <?php renderDepartmentOptionGroups($fd['college_id'] ?? null); ?>
+                    </select>
+                </div>
+            </div>
+
+            <div class="um-form-section mt-4"><i class="fas fa-lock"></i> Account Security</div>
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <label class="um-form-label">New Password <span style="font-weight:400;color:#999;">(leave blank to keep current)</span></label>
+                    <input type="password" class="form-control" name="password" minlength="6" placeholder="Min. 6 characters">
+                </div>
+                <div class="col-md-6">
+                    <label class="um-form-label">Confirm New Password</label>
+                    <input type="password" class="form-control" name="confirm_password" minlength="6">
+                </div>
+            </div>
+
+            <div class="d-flex gap-2 mt-4">
+                <button type="submit" class="um-btn um-btn-primary" style="padding:10px 24px;font-size:0.87rem;">
+                    <i class="fas fa-save"></i> Save Changes
+                </button>
+                <a href="users.php" class="um-btn um-btn-secondary" style="padding:10px 20px;font-size:0.87rem;">Cancel</a>
+            </div>
+        </form>
+    </div>
+    </div>
+
+    <div class="col-lg-4">
+        <div class="um-tip-card">
+            <div style="font-size:0.78rem;font-weight:800;color:#8B0000;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:14px;">
+                <i class="fas fa-lightbulb me-1"></i> Guidelines
+            </div>
+            <div class="um-tip-item">
+                <div class="um-tip-dot"><i class="fas fa-key"></i></div>
+                <div>Only fill the password fields if you want to <strong>reset</strong> this user's password.</div>
+            </div>
+            <div class="um-tip-item">
+                <div class="um-tip-dot"><i class="fas fa-user-shield"></i></div>
+                <div><strong>Admin</strong> accounts have full system access. Assign with care.</div>
+            </div>
+            <div class="um-tip-item">
+                <div class="um-tip-dot"><i class="fas fa-building"></i></div>
+                <div>Department / Office applies to any user.</div>
+            </div>
+        </div>
+    </div>
+    </div>
+    <?php unset($_SESSION['user_form_errors'], $_SESSION['user_form_data']); ?>
+
+<?php else: ?>
+    <?php
+    $count_total  = count($all_users);
+    $count_active = count(array_filter($all_users, fn($u) => $u['is_active']));
+    $count_admin  = count(array_filter($all_users, fn($u) => $u['role'] === 'admin'));
+    $avatar_colors = ['#8B0000','#1d4ed8','#15803d','#b45309','#7c3aed','#0e7490'];
+
+    // Precompute per-user history counts, so the delete modal can tell the admin up
+    // front exactly what else will be deleted along with the account.
+    $history_counts = [];
+    foreach (getRequests() as $r)        { $history_counts[$r['user_id']]['requests']    = ($history_counts[$r['user_id']]['requests']    ?? 0) + 1; }
+    foreach (getBorrowRecords() as $b)   { $history_counts[$b['user_id']]['borrows']      = ($history_counts[$b['user_id']]['borrows']      ?? 0) + 1; }
+    foreach (getUserOwnedItems() as $o)  { $history_counts[$o['user_id']]['owned_items']  = ($history_counts[$o['user_id']]['owned_items']  ?? 0) + 1; }
+
+    // Pagination
+    $um_per_page    = 12;
+    $um_total_pages = max(1, (int)ceil(count($all_users) / $um_per_page));
+    $um_page        = max(1, min($um_total_pages, (int)($_GET['page'] ?? 1)));
+    $um_offset      = ($um_page - 1) * $um_per_page;
+    $all_users_page = array_slice($all_users, $um_offset, $um_per_page);
+    ?>
+
+    <!-- Stats -->
+    <div class="um-stats">
+        <div class="um-stat-card">
+            <div class="um-stat-icon" style="background:rgba(139,0,0,0.10);color:#8B0000;"><i class="fas fa-users"></i></div>
+            <div><div class="um-stat-val"><?php echo $count_total; ?></div><div class="um-stat-lbl">Total Users</div></div>
+        </div>
+        <div class="um-stat-card">
+            <div class="um-stat-icon" style="background:rgba(34,197,94,0.12);color:#15803d;"><i class="fas fa-user-check"></i></div>
+            <div><div class="um-stat-val"><?php echo $count_active; ?></div><div class="um-stat-lbl">Active</div></div>
+        </div>
+        <div class="um-stat-card">
+            <div class="um-stat-icon" style="background:rgba(245,158,11,0.12);color:#b45309;"><i class="fas fa-user-shield"></i></div>
+            <div><div class="um-stat-val"><?php echo $count_admin; ?></div><div class="um-stat-lbl">Administrators</div></div>
+        </div>
+    </div>
+
+    <!-- Header -->
+    <div class="um-header">
+        <div>
+            <div class="um-header-title">All Accounts</div>
+            <div class="um-header-sub"><?php echo $count_total; ?> registered user<?php echo $count_total !== 1 ? 's' : ''; ?> in the system</div>
+        </div>
+        <a href="users.php?action=add" class="um-btn um-btn-primary">
+            <i class="fas fa-user-plus"></i> Add New User
+        </a>
+    </div>
+
+    <!-- Card Grid -->
+    <div class="um-grid">
+    <?php foreach ($all_users_page as $u):
+        $col      = $avatar_colors[($u['id'] - 1) % count($avatar_colors)];
+        $initials = strtoupper(substr($u['full_name'], 0, 1));
+        $dept_name = (!empty($u['college_id']) && isset($all_department_names[$u['college_id']])) ? $all_department_names[$u['college_id']] : '';
+        $is_me = ($u['id'] === $current_user['id']);
+    ?>
+    <div class="um-user-card">
+        <!-- Top: avatar + name -->
+        <div class="um-card-top">
+            <div class="um-avatar" style="background:<?php echo $col; ?>;"><?php echo $initials; ?></div>
+            <div style="min-width:0;">
+                <div class="um-card-name"><?php echo htmlspecialchars($u['full_name']); ?><?php if ($is_me): ?> <span style="font-size:0.68rem;font-weight:600;color:rgba(0,0,0,0.35);">(You)</span><?php endif; ?></div>
+                <div class="um-card-email"><?php echo htmlspecialchars($u['email']); ?></div>
+                <?php if (!empty($u['phone'])): ?>
+                <div class="um-card-phone"><i class="fas fa-phone" style="font-size:0.65rem;margin-right:3px;"></i><?php echo htmlspecialchars($u['phone']); ?></div>
+                <?php endif; ?>
+            </div>
+        </div>
+
+        <!-- Badges row -->
+        <div style="display:flex;flex-wrap:wrap;gap:6px;">
+            <span class="um-badge um-badge-<?php echo $u['role']; ?>">
+                <i class="fas <?php echo $u['role'] === 'admin' ? 'fa-user-shield' : 'fa-user'; ?>"></i>
+                <?php echo $u['role'] === 'admin' ? 'Administrator' : 'Faculty / Staff'; ?>
+            </span>
+            <span class="um-badge <?php echo $u['is_active'] ? 'um-badge-active' : 'um-badge-inactive'; ?>">
+                <i class="fas fa-circle" style="font-size:0.45rem;"></i>
+                <?php echo $u['is_active'] ? 'Active' : 'Inactive'; ?>
+            </span>
+        </div>
+
+        <!-- Meta info -->
+        <div class="um-card-meta">
+            <div class="um-card-meta-item" style="width:100%;">
+                <i class="fas fa-sitemap"></i>
+                <span><?php echo htmlspecialchars($dept_name ?: '—'); ?></span>
+            </div>
+        </div>
+
+        <!-- Footer: joined + actions -->
+        <div class="um-card-footer">
+            <div class="um-card-joined"><i class="fas fa-calendar-alt" style="margin-right:4px;opacity:0.5;"></i>Joined <?php echo date('M d, Y', strtotime($u['created_at'])); ?></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                <a href="users.php?action=edit&id=<?php echo $u['id']; ?>" class="um-btn um-btn-sm um-btn-secondary">
+                    <i class="fas fa-pen"></i> Edit
+                </a>
+                <?php if (!$is_me): ?>
+                <form method="POST" action="users.php" style="display:inline;">
+                    <input type="hidden" name="action" value="toggle_status">
+                    <input type="hidden" name="user_id" value="<?php echo $u['id']; ?>">
+                    <button type="submit" class="um-btn um-btn-sm <?php echo $u['is_active'] ? 'um-btn-toggle-on' : 'um-btn-toggle-off'; ?>">
+                        <i class="fas <?php echo $u['is_active'] ? 'fa-user-slash' : 'fa-user-check'; ?>"></i>
+                        <?php echo $u['is_active'] ? 'Deactivate' : 'Activate'; ?>
+                    </button>
+                </form>
+                <button type="button" class="um-btn um-btn-sm" style="background:rgba(239,68,68,0.09);color:#dc2626;border:1px solid rgba(239,68,68,0.18);"
+                        data-bs-toggle="modal" data-bs-target="#deleteModal-<?php echo $u['id']; ?>">
+                    <i class="fas fa-trash"></i> Delete
+                </button>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+
+    <?php if (!$is_me):
+        $__hc = $history_counts[$u['id']] ?? [];
+        $__n_req = $__hc['requests'] ?? 0;
+        $__n_brw = $__hc['borrows'] ?? 0;
+        $__n_own = $__hc['owned_items'] ?? 0;
+        $__has_history = ($__n_req + $__n_brw + $__n_own) > 0;
+    ?>
+    <!-- Delete Confirmation Modal -->
+    <div class="modal fade" id="deleteModal-<?php echo $u['id']; ?>" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="fas fa-trash me-2" style="color:#dc2626;"></i>Delete Account</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px;background:#f7f7f7;border-radius:8px;">
+                        <div class="um-avatar" style="background:<?php echo $col; ?>;width:38px;height:38px;font-size:0.9rem;"><?php echo $initials; ?></div>
+                        <div>
+                            <div style="font-weight:700;font-size:0.88rem;color:#1a1d23;"><?php echo htmlspecialchars($u['full_name']); ?></div>
+                            <div style="font-size:0.78rem;color:rgba(0,0,0,0.45);"><?php echo htmlspecialchars($u['email']); ?></div>
+                        </div>
+                    </div>
+                    <?php if ($__has_history): ?>
+                    <div style="display:flex;gap:10px;padding:12px 14px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);border-radius:8px;color:#b91c1c;font-size:0.85rem;">
+                        <i class="fas fa-triangle-exclamation" style="margin-top:2px;flex-shrink:0;"></i>
+                        <div>
+                            This account has history. Deleting it will <strong>also permanently delete</strong>:
+                            <ul style="margin:8px 0 0;padding-left:18px;">
+                                <?php if ($__n_req): ?><li><?php echo $__n_req; ?> request(s)</li><?php endif; ?>
+                                <?php if ($__n_brw): ?><li><?php echo $__n_brw; ?> borrow record(s)</li><?php endif; ?>
+                                <?php if ($__n_own): ?><li><?php echo $__n_own; ?> owned item record(s)</li><?php endif; ?>
+                            </ul>
+                            This cannot be undone. If you just want to block access and keep the history, use <strong>Deactivate</strong> from the card instead.
+                        </div>
+                    </div>
+                    <?php else: ?>
+                    <p style="font-size:0.88rem;color:#374151;margin:0;">
+                        This will <strong>permanently delete</strong> this account. This action cannot be undone.
+                    </p>
+                    <?php endif; ?>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="um-btn um-btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <form method="POST" action="users.php" style="display:inline;">
+                        <input type="hidden" name="action" value="delete_user">
+                        <input type="hidden" name="user_id" value="<?php echo $u['id']; ?>">
+                        <button type="submit" class="um-btn" style="background:#dc2626;color:#fff;padding:8px 16px;">
+                            <i class="fas fa-trash me-1"></i> <?php echo $__has_history ? 'Delete Everything' : 'Delete Permanently'; ?>
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+    <?php endforeach; ?>
+    </div>
+
+    <!-- Pagination -->
+    <?php if ($um_total_pages > 1): ?>
+    <div class="d-flex justify-content-center align-items-center gap-2 mt-4">
+        <a href="users.php?page=<?php echo max(1, $um_page - 1); ?>"
+           class="btn btn-sm <?php echo $um_page <= 1 ? 'disabled' : ''; ?>"
+           style="background:#fff;border:1px solid #e5e7eb;color:#555;font-weight:600;<?php echo $um_page <= 1 ? 'pointer-events:none;opacity:0.5;' : ''; ?>">
+            <i class="fas fa-chevron-left"></i>
+        </a>
+        <?php for ($i = 1; $i <= $um_total_pages; $i++): ?>
+        <a href="users.php?page=<?php echo $i; ?>"
+           class="btn btn-sm"
+           style="min-width:38px; font-weight:700; <?php echo $i === $um_page
+                ? 'background:#8B0000;border:1px solid #8B0000;color:#fff;'
+                : 'background:#fff;border:1px solid #e5e7eb;color:#555;'; ?>">
+            <?php echo $i; ?>
+        </a>
+        <?php endfor; ?>
+        <a href="users.php?page=<?php echo min($um_total_pages, $um_page + 1); ?>"
+           class="btn btn-sm <?php echo $um_page >= $um_total_pages ? 'disabled' : ''; ?>"
+           style="background:#fff;border:1px solid #e5e7eb;color:#555;font-weight:600;<?php echo $um_page >= $um_total_pages ? 'pointer-events:none;opacity:0.5;' : ''; ?>">
+            <i class="fas fa-chevron-right"></i>
+        </a>
+    </div>
+    <div class="text-center" style="font-size:0.78rem;color:rgba(0,0,0,0.42);margin-top:8px;">
+        Showing <?php echo $um_offset + 1; ?>–<?php echo min($um_offset + $um_per_page, $count_total); ?> of <?php echo $count_total; ?> users
+    </div>
+    <?php endif; ?>
+<?php endif; ?>
+
+</div>
+</div>
+
+<?php require_once dirname(__DIR__) . '/includes/footer.php'; ?>

@@ -1,0 +1,2399 @@
+<?php
+$page_title = 'Submit Request';
+require_once dirname(__DIR__) . '/config/functions.php';
+
+requireUser();
+
+$current_user = getCurrentUser();
+
+// Check if item_id is passed from inventory page. "type" tells us which catalog
+// (borrow vs item/acquire) to pre-select — the Inventory page links here with the
+// type that actually applies to the item's acquisition_mode (see user/inventory.php).
+$auto_fill_item = null;
+$auto_fill_item_id = null;
+$auto_fill_type = in_array($_GET['type'] ?? '', ['borrow', 'item']) ? $_GET['type'] : 'borrow';
+if (isset($_GET['item_id'])) {
+    $item_id = (int)$_GET['item_id'];
+    $all_items = getInventory();
+    foreach ($all_items as $item) {
+        if ($item['id'] === $item_id && $item['status'] === 'available') {
+            $auto_fill_item = $item['item_name'];
+            $auto_fill_item_id = $item['id'];
+            break;
+        }
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $request_type     = sanitizeInput($_POST['request_type']);
+    $urgency          = in_array($_POST['urgency'] ?? '', ['low','medium','high','critical']) ? $_POST['urgency'] : 'medium';
+    $safe_type        = in_array($request_type, ['borrow','item','service']) ? $request_type : 'borrow';
+    // Delivery/pickup only makes sense for a physical item changing hands —
+    // a maintenance/service ticket never gets "delivered". The form's
+    // receiving-method radios are only hidden (not disabled) for the service
+    // tab, so their default-checked value still rides along in the POST body
+    // even though the section was never shown — force it out explicitly
+    // rather than trusting the client to have actually hidden it.
+    $receiving_method = ($safe_type !== 'service' && in_array($_POST['receiving_method'] ?? '', ['delivery','pickup']))
+        ? $_POST['receiving_method'] : null;
+
+    $cart_items = json_decode($_POST['items_json'] ?? '[]', true);
+
+    // Reject any submission carrying a "Date Needed" or "Expected Return Date"
+    // before today — checked against the cart payload itself (not just the
+    // client-side min= attribute below), since that's client-editable.
+    $today_for_validation = appToday();
+    $has_past_date = false;
+    if (is_array($cart_items)) {
+        foreach ($cart_items as $__entry) {
+            if ((!empty($__entry['date_needed']) && $__entry['date_needed'] < $today_for_validation)
+                || (!empty($__entry['return_date']) && $__entry['return_date'] < $today_for_validation)) {
+                $has_past_date = true;
+                break;
+            }
+        }
+    }
+
+    if (!is_array($cart_items) || empty($cart_items)) {
+        $submit_error = 'No items in your request. Please add at least one item.';
+    } elseif ($has_past_date) {
+        $submit_error = 'Date Needed and Expected Return Date cannot be in the past — please choose today or a future date.';
+    } else {
+        $errors   = [];
+        $availability_notices = []; // "only 2 of 5 were still available" style — not a save failure
+        $all_inv  = getInventory();
+        $group_id = generateGroupId(); // shared across all units in this submission
+
+        // Pre-fetch latest request number once to avoid N round-trips
+        $base_rows = supabase()->select('requests', 'select=request_number&order=id.desc&limit=1');
+        preg_match('/REQ-(\d+)$/', $base_rows[0]['request_number'] ?? 'REQ-00000', $_m);
+        $next_num = isset($_m[1]) ? (int)$_m[1] + 1 : 1;
+
+        // Shared fields from first cart entry
+        $first  = $cart_items[0];
+        $shared = [
+            'user_id'          => $current_user['id'],
+            'request_type'     => $safe_type,
+            'group_id'         => $group_id,
+            'urgency'          => $urgency,
+            'receiving_method' => $receiving_method,
+            'status'           => 'pending',
+            'quantity_requested' => 1, // every row = 1 physical unit
+        ];
+        if ($safe_type === 'borrow') {
+            $shared['reason_for_request']   = sanitizeInput($first['reason'] ?? '');
+            $shared['expected_return_date'] = !empty($first['return_date']) ? $first['return_date'] : null;
+            $shared['date_needed']          = !empty($first['date_needed']) ? $first['date_needed'] : null;
+        } elseif ($safe_type === 'item') {
+            $shared['reason_for_request'] = sanitizeInput($first['reason'] ?? '');
+            $shared['date_needed']        = !empty($first['date_needed']) ? $first['date_needed'] : null;
+        } elseif ($safe_type === 'service') {
+            // No inventory link anymore (pure free text) — the subject name is the only
+            // display name available, so fold it into service_description alongside the
+            // type + details so every "resolve item/service name" fallback still finds it.
+            $svc_subject = sanitizeInput($first['name'] ?? 'Service Request');
+            $svc_type    = sanitizeInput($first['service_type'] ?? '');
+            $svc_desc    = sanitizeInput($first['description'] ?? '');
+            $shared['service_description'] = $svc_subject . ($svc_type ? " [$svc_type]" : '') . ($svc_desc ? " — $svc_desc" : '');
+            $shared['date_needed']         = !empty($first['date_needed']) ? $first['date_needed'] : null;
+        }
+
+        // Collect all units to create as individual request rows
+        $units_to_save = []; // each: ['inventory_id', 'qr_code_id', 'item_name']
+
+        // Units already assigned to a request row in this submission — a cart can
+        // reference the same physical unit more than once (two entries for the
+        // same item, or a stale unit_ids list), so this is shared across every
+        // cart entry below, not reset per entry.
+        $claimed_unit_ids = [];
+
+        // Resolves a cart entry's requested quantity down to the units that are
+        // actually still available right now — $all_inv was fetched fresh above,
+        // so this catches a request that's stale (page loaded before someone else
+        // took the item) or tampered (qty raised past what the client ever offered).
+        // Returns the list of unit ids to actually save (never more than $qty,
+        // never a unit already claimed, never one that isn't status=available).
+        $claimAvailableUnits = function(array $candidate_ids, int $qty) use ($all_inv, &$claimed_unit_ids) {
+            $usable = [];
+            foreach ($candidate_ids as $cid) {
+                if (count($usable) >= $qty) break;
+                $cid = (int)$cid;
+                // Claim immediately (not after the loop) — candidate_ids can contain
+                // the same id more than once (a batch row's id repeated to stand in
+                // for several of its units, or a tampered/duplicated list), and
+                // checking against a list only updated at the end would let a
+                // repeated id be counted as a different available unit each time.
+                if (in_array($cid, $claimed_unit_ids, true)) continue;
+                $row = findById($all_inv, $cid);
+                if (!$row || $row['status'] !== 'available') continue;
+                $usable[] = $cid;
+                $claimed_unit_ids[] = $cid;
+            }
+            return $usable;
+        };
+
+        foreach ($cart_items as $entry) {
+            if ($safe_type === 'borrow') {
+                $unit_ids      = isset($entry['unit_ids']) && is_array($entry['unit_ids']) ? $entry['unit_ids'] : [];
+                $inv_id        = !empty($entry['inventory_id']) ? (int)$entry['inventory_id'] : null;
+                $qty_requested = max(1, (int)($entry['qty'] ?? 1));
+                $candidate_ids = !empty($unit_ids) ? $unit_ids : ($inv_id ? [$inv_id] : []);
+                $usable_ids    = $claimAvailableUnits($candidate_ids, $qty_requested);
+
+                if (count($usable_ids) < $qty_requested) {
+                    $label = htmlspecialchars($entry['name'] ?? 'item');
+                    $availability_notices[] = count($usable_ids) > 0
+                        ? "Only " . count($usable_ids) . " of $qty_requested unit(s) of '$label' were still available — the rest were not requested."
+                        : "'$label' is no longer available.";
+                }
+
+                foreach ($usable_ids as $uid) {
+                    $unit_item = findById($all_inv, $uid);
+                    // Always use the inventory item's own QR; generate only when no inventory row exists
+                    $unit_qr   = ($unit_item && !empty($unit_item['qr_code_id']))
+                                 ? $unit_item['qr_code_id']
+                                 : generateQRCodeId();
+                    $units_to_save[] = [
+                        'inventory_id' => $uid,
+                        'qr_code_id'   => $unit_qr,
+                        'item_name'    => $unit_item['item_name'] ?? $entry['name'] ?? 'Unknown',
+                    ];
+                }
+            } elseif ($safe_type === 'item') {
+                $name          = sanitizeInput($entry['name'] ?? '');
+                $qty_requested = max(1, (int)($entry['qty'] ?? 1));
+                $unit_ids      = isset($entry['unit_ids']) && is_array($entry['unit_ids']) ? $entry['unit_ids'] : [];
+                $inv_id        = !empty($entry['inventory_id']) ? (int)$entry['inventory_id'] : null;
+                $candidate_ids = !empty($unit_ids) ? $unit_ids : ($inv_id ? [$inv_id] : []);
+
+                if (empty($candidate_ids)) {
+                    // Custom item with no catalog match — not tied to existing stock, so
+                    // there's nothing to run out of. Don't create an inventory record yet;
+                    // it only gets counted in inventory once admin approves the request.
+                    for ($q = 0; $q < $qty_requested; $q++) {
+                        $units_to_save[] = ['inventory_id' => null, 'qr_code_id' => generateQRCodeId(), 'item_name' => $name];
+                    }
+                } else {
+                    $usable_ids = $claimAvailableUnits($candidate_ids, $qty_requested);
+                    if (count($usable_ids) < $qty_requested) {
+                        $label = htmlspecialchars($name);
+                        $availability_notices[] = count($usable_ids) > 0
+                            ? "Only " . count($usable_ids) . " of $qty_requested unit(s) of '$label' were still available — the rest were not requested."
+                            : "'$label' is no longer available.";
+                    }
+                    foreach ($usable_ids as $uid) {
+                        $unit_item = findById($all_inv, $uid);
+                        $unit_qr   = ($unit_item && !empty($unit_item['qr_code_id']))
+                                     ? $unit_item['qr_code_id']
+                                     : generateQRCodeId();
+                        $units_to_save[] = [
+                            'inventory_id' => $uid,
+                            'qr_code_id'   => $unit_qr,
+                            'item_name'    => $unit_item['item_name'] ?? $name,
+                        ];
+                    }
+                }
+            } elseif ($safe_type === 'service') {
+                // Pure free-text now — no item dropdown/inventory link, just what the user typed.
+                // No QR code either — it's a ticket, not a physical unit that needs a sticker.
+                $units_to_save[] = [
+                    'inventory_id' => null,
+                    'qr_code_id'   => null,
+                    'item_name'    => sanitizeInput($entry['name'] ?? 'Service Request'),
+                ];
+            }
+        }
+
+        // Create one request row per unit — each gets its own request_number
+        $first_req_number = null;
+        foreach ($units_to_save as $unit) {
+            $req_number = 'REQ-' . str_pad($next_num++, 5, '0', STR_PAD_LEFT);
+            if (!$first_req_number) $first_req_number = $req_number;
+            $unit_fields = [
+                'request_number' => $req_number,
+                'inventory_id'   => $unit['inventory_id'],
+                'qr_code_id'     => $unit['qr_code_id'],
+            ];
+            if ($safe_type !== 'service' && empty($unit['inventory_id'])) {
+                // No catalog item to join against — stash the custom name so it still displays before approval
+                $unit_fields['service_description'] = $unit['item_name'];
+            }
+            $result = dbCreateRequest(array_merge($shared, $unit_fields));
+            if (!$result['success']) {
+                $errors[] = 'Failed to save ' . htmlspecialchars($unit['item_name']) . ': ' . $result['error'];
+                continue;
+            }
+            if (!empty($unit['inventory_id'])) {
+                // Mark the physical unit unavailable immediately so no one else can request it.
+                // (Service requests never reach here with an inventory_id — they're always
+                // submitted as pure free-text tickets with no catalog item attached.)
+                dbUpdateInventory((int)$unit['inventory_id'], ['status' => 'requested']);
+            }
+        }
+
+        $total_qty = count($units_to_save);
+
+        if (empty($errors) && $total_qty === 0) {
+            // Nothing could actually be created — every requested item's availability
+            // ran out between page load and submit (see $availability_notices above).
+            $submit_error = !empty($availability_notices)
+                ? implode(' ', $availability_notices)
+                : 'None of the requested items could be submitted.';
+        } else {
+            logActivity($current_user['id'], 'CREATE', "Submitted $safe_type group $group_id ($total_qty unit(s))", 'requests', 0);
+
+            if (empty($errors)) {
+                $__type_labels = ['borrow' => termLabel('Borrow'), 'item' => 'Item', 'service' => 'Service'];
+                $__names = array_values(array_unique(array_column($units_to_save, 'item_name')));
+                notifyAdmins(
+                    'New ' . ($__type_labels[$safe_type] ?? ucfirst($safe_type)) . ' request',
+                    $current_user['full_name'] . ' submitted ' . $total_qty . ' item(s): ' . implode(', ', array_slice($__names, 0, 3)) . (count($__names) > 3 ? '…' : ''),
+                    'info',
+                    'admin/requests.php?action=view&group_id=' . urlencode($group_id)
+                );
+                $success_msg = $total_qty . ' item(s) submitted successfully (Group: ' . $group_id . ')!';
+                if (!empty($availability_notices)) $success_msg .= ' ' . implode(' ', $availability_notices);
+                redirectWithMessage('my-requests.php', $success_msg, empty($availability_notices) ? 'success' : 'warning');
+            } else {
+                $submit_error = 'Some requests failed to save: ' . implode('; ', $errors);
+            }
+        }
+    }
+}
+
+require_once dirname(__DIR__) . '/includes/header.php';
+require_once dirname(__DIR__) . '/includes/navbar.php';
+?>
+<div class="main-wrapper">
+<?php
+// Fire all the whole-table Supabase fetches this page needs concurrently
+// instead of one-by-one — see config/data.php.
+warmSharedCache();
+
+$all_inventory  = getInventory();
+// Inventory is a single global list — no more campus scoping.
+$inventory_items = $all_inventory;
+usort($inventory_items, function($a, $b) { return strcmp($a['item_name'], $b['item_name']); });
+
+// Item request catalog — all inventory items, grouped
+$all_sorted = $all_inventory;
+usort($all_sorted, function($a, $b) { return strcmp($a['item_name'], $b['item_name']); });
+$catalog_by_category = [];
+foreach (groupInventoryItems($all_sorted) as $group) {
+    $catalog_by_category[$group['category'] ?: 'Other'][] = $group;
+}
+
+// Borrow catalog: available + borrowed + requested items, grouped
+$borrow_records_all = getBorrowRecords();
+$item_avail_data = [];
+
+// Return dates from active/overdue borrow records (already delivered). "Overdue" is
+// computed from the date itself (expected_return_date already passed, still not
+// returned) rather than trusted from the status column, which nothing ever flips
+// to 'overdue' automatically.
+$__today_str = appToday();
+foreach ($borrow_records_all as $br) {
+    if (in_array($br['status'], ['active', 'overdue']) && empty($br['actual_return_date'])) {
+        $iid = $br['inventory_id'];
+        if (!isset($item_avail_data[$iid])) $item_avail_data[$iid] = [];
+        $item_avail_data[$iid][] = [
+            'return_date' => $br['expected_return_date'],
+            'is_overdue'  => !empty($br['expected_return_date']) && $br['expected_return_date'] < $__today_str,
+        ];
+    }
+}
+
+// Return dates from pending/approved borrow requests (not yet delivered, no borrow record yet)
+foreach (getRequests() as $req) {
+    if ($req['request_type'] === 'borrow'
+        && in_array($req['status'], ['pending', 'approved'])
+        && !empty($req['inventory_id'])
+        && !empty($req['expected_return_date'])) {
+        $iid = (int)$req['inventory_id'];
+        if (!isset($item_avail_data[$iid])) $item_avail_data[$iid] = [];
+        $item_avail_data[$iid][] = [
+            'return_date' => $req['expected_return_date'],
+            'is_overdue'  => false,
+        ];
+    }
+}
+
+$item_avail_json = json_encode($item_avail_data);
+
+$borrowable = array_values(array_filter($all_inventory, function($item) {
+    // "Request / Acquire Only" items (e.g. consumables, allocate-then-issue stock) are
+    // deliberately excluded from the Borrow catalog — they're not meant to be lent out.
+    if (($item['acquisition_mode'] ?? 'borrow') === 'request') return false;
+    return in_array($item['status'], ['available', 'borrowed', 'requested']);
+}));
+usort($borrowable, function($a, $b) { return strcmp($a['item_name'], $b['item_name']); });
+$borrow_catalog = [];
+foreach (groupInventoryItems($borrowable) as $group) {
+    // Precompute per-group availability
+    $avail_units = array_values(array_filter($group['units'], fn($u) => $u['status'] === 'available'));
+    $group['available_count']    = count($avail_units);
+    $group['first_available_id'] = ($avail_units[0] ?? $group['units'][0])['id'];
+    $group['available_unit_ids'] = array_column($avail_units, 'id');
+    // Aggregate return dates across all units
+    $group_ret = [];
+    foreach ($group['units'] as $u) {
+        foreach ($item_avail_data[$u['id']] ?? [] as $r) $group_ret[] = $r;
+    }
+    $group['return_records'] = $group_ret;
+    $borrow_catalog[$group['category'] ?: 'Other'][] = $group;
+}
+
+displayMessage();
+if (!empty($submit_error)): ?>
+<div style="background:rgba(220,38,38,0.07);border:1px solid rgba(220,38,38,0.30);border-radius:8px;padding:14px 18px;margin-bottom:18px;color:#dc2626;font-size:0.88rem;font-weight:600;display:flex;align-items:center;gap:10px;">
+    <i class="fas fa-exclamation-circle"></i>
+    <span><?php echo htmlspecialchars($submit_error); ?></span>
+</div>
+<?php endif;
+?>
+
+<style>
+/* ===== SUBMIT REQUEST — REDESIGN ===== */
+:root { --red:#8B0000; --red2:#b91c1c; }
+
+/* ── Step indicator ── */
+.rq-steps {
+    display:flex; align-items:center; justify-content:center;
+    gap:0; margin-bottom:28px;
+}
+.rq-step-item { display:flex; flex-direction:column; align-items:center; flex:1; max-width:140px; position:relative; }
+.rq-step-dot {
+    width:34px; height:34px; border-radius:50%;
+    display:flex; align-items:center; justify-content:center;
+    font-size:0.78rem; font-weight:800; z-index:2;
+    background:rgba(0,0,0,0.06); color:rgba(0,0,0,0.30);
+    border:2px solid rgba(0,0,0,0.10);
+    transition:all 0.25s;
+}
+.rq-step-dot.active {
+    background:var(--red);
+    color:#fff; border-color:var(--red);
+}
+.rq-step-dot.done { background:#22c55e; border-color:#22c55e; color:#fff; }
+.rq-step-lbl {
+    font-size:0.67rem; font-weight:700; margin-top:5px; text-align:center;
+    color:rgba(0,0,0,0.35); text-transform:uppercase; letter-spacing:0.3px;
+}
+.rq-step-lbl.active { color:var(--red); }
+.rq-step-lbl.done   { color:#15803d; }
+.rq-step-connector {
+    flex:1; height:2px; background:rgba(0,0,0,0.08);
+    margin-top:-22px; position:relative; z-index:1;
+    max-width:80px;
+}
+.rq-step-connector.done { background:#22c55e; }
+
+/* ── Type cards ── */
+.rq-type-grid {
+    display:grid; grid-template-columns:repeat(3,1fr); gap:14px;
+    margin-bottom:0;
+}
+@media(max-width:600px){ .rq-type-grid { grid-template-columns:1fr; } }
+@media(max-width:600px){ #receiving_method_grid { grid-template-columns:1fr !important; } }
+.rq-type-card {
+    background:#fff; border:2px solid #e5e7eb; border-radius:8px;
+    padding:20px 18px 16px; cursor:pointer;
+    transition:border-color 0.15s; user-select:none; position:relative;
+    overflow:hidden;
+}
+.rq-type-card:hover { border-color:rgba(139,0,0,0.30); }
+.rq-type-card.selected {
+    border-color:var(--red) !important;
+    background:#fff !important;
+}
+.rq-type-check {
+    position:absolute; top:12px; right:12px;
+    width:20px; height:20px; border-radius:50%;
+    background:var(--red); color:#fff;
+    display:flex; align-items:center; justify-content:center;
+    font-size:0.60rem; opacity:0; transform:scale(0.5);
+    transition:all 0.20s;
+}
+.rq-type-card.selected .rq-type-check { opacity:1; transform:scale(1); }
+.rq-type-card input[type=radio] { display:none; }
+.rq-type-icon {
+    width:36px; height:36px;
+    display:flex; align-items:center; justify-content:center;
+    font-size:1.2rem; margin-bottom:12px;
+}
+.rq-type-card h6 { font-size:0.93rem; font-weight:800; color:#1a1d23; margin:0 0 5px; }
+.rq-type-card p  { font-size:0.76rem; color:rgba(0,0,0,0.42); margin:0; line-height:1.4; }
+
+/* ── Layout wrapper ── */
+.rq-layout { display:grid; grid-template-columns:1fr 300px; gap:20px; align-items:start; }
+@media(max-width:900px){
+    .rq-layout { grid-template-columns:1fr; }
+    .rq-summary-card { position:static; max-height:none; overflow:visible; }
+}
+
+/* ── Sidebar scrollbar ── */
+.rq-summary-card::-webkit-scrollbar {
+    width: 6px;
+}
+.rq-summary-card::-webkit-scrollbar-track {
+    background: #f1f1f1;
+    border-radius: 0 8px 8px 0;
+    margin: 6px 0;
+}
+.rq-summary-card::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, #8B0000 0%, #b91c1c 100%);
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.3);
+    transition: background 0.2s;
+}
+.rq-summary-card::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, #6b0000 0%, #8B0000 100%);
+}
+.rq-summary-card { scrollbar-width:thin; scrollbar-color:#8B0000 #f1f1f1; }
+
+/* ── Form card ── */
+.rq-form-card {
+    background:#fff; border:1px solid #e5e7eb; border-radius:8px;
+    box-shadow:0 1px 4px rgba(0,0,0,0.06);
+    overflow:hidden;
+}
+.rq-form-head {
+    padding:18px 24px 16px;
+    border-bottom:1px solid rgba(0,0,0,0.06);
+    display:flex; align-items:center; gap:10px;
+}
+.rq-form-head-icon {
+    width:30px; height:30px;
+    display:flex; align-items:center; justify-content:center;
+    font-size:0.95rem; flex-shrink:0;
+}
+.rq-form-head-title { font-size:0.95rem; font-weight:800; color:#1a1d23; margin:0; }
+.rq-form-head-sub   { font-size:0.75rem; color:rgba(0,0,0,0.40); margin:1px 0 0; }
+.rq-form-body { padding:22px 24px; }
+
+.rq-section-title {
+    font-size:0.70rem; font-weight:800; text-transform:uppercase;
+    letter-spacing:0.7px; color:rgba(0,0,0,0.36);
+    margin-bottom:14px; display:flex; align-items:center; gap:6px;
+}
+.rq-section-title::after {
+    content:''; flex:1; height:1px; background:rgba(0,0,0,0.07);
+}
+.rq-divider { border-color:rgba(0,0,0,0.07); margin:20px 0; }
+
+/* Improved form controls */
+.rq-field { margin-bottom:18px; }
+.rq-field label {
+    font-size:0.80rem; font-weight:700; color:rgba(0,0,0,0.60);
+    margin-bottom:6px; display:flex; align-items:center; gap:5px;
+}
+.rq-field label .rq-req { color:var(--red); font-size:0.75rem; }
+.rq-input-wrap { position:relative; }
+.rq-input-icon {
+    position:absolute; left:12px; top:50%; transform:translateY(-50%);
+    color:rgba(0,0,0,0.30); font-size:0.80rem; pointer-events:none;
+}
+.rq-input-icon-ta { top:14px; transform:none; }
+.rq-input-wrap .form-control,
+.rq-input-wrap .form-select {
+    border-radius:6px !important; border:1px solid #e5e7eb !important;
+    font-size:0.88rem !important; padding:10px 12px 10px 36px !important;
+    background:#fff !important;
+    transition:border-color 0.15s !important;
+}
+.rq-input-wrap .form-control:focus,
+.rq-input-wrap .form-select:focus {
+    border-color:var(--red) !important;
+    box-shadow:none !important; outline:none !important;
+}
+/* fields without icon */
+.form-control.rq-no-icon, .form-select.rq-no-icon {
+    border-radius:6px !important; border:1px solid #e5e7eb !important;
+    font-size:0.88rem !important; background:#fff !important;
+    transition:border-color 0.15s !important;
+}
+.form-control.rq-no-icon:focus, .form-select.rq-no-icon:focus {
+    border-color:var(--red) !important;
+    box-shadow:none !important; outline:none !important;
+}
+.rq-input-wrap textarea.form-control { padding-top:10px !important; }
+
+/* Urgency cards */
+.urgency-group { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
+@media(max-width:500px){ .urgency-group { grid-template-columns:repeat(2,1fr); } }
+.urgency-pill {
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:5px; padding:10px 8px; border-radius:6px;
+    border:1px solid #e5e7eb;
+    background:#fff; cursor:pointer;
+    font-size:0.78rem; font-weight:700; color:#555;
+    transition:border-color 0.15s; user-select:none; text-align:center;
+}
+.urgency-pill input[type=radio] { display:none; }
+.urgency-pill i { font-size:1rem; }
+.urgency-pill:hover { border-color:#aaa; color:#111; }
+.urgency-pill.selected-low      { background:rgba(34,197,94,0.12);  border-color:#22c55e; color:#15803d; }
+.urgency-pill.selected-medium   { background:rgba(59,130,246,0.12); border-color:#3b82f6; color:#1d4ed8; }
+.urgency-pill.selected-high     { background:rgba(245,158,11,0.12); border-color:#f59e0b; color:#b45309; }
+.urgency-pill.selected-critical { background:rgba(239,68,68,0.12);  border-color:#ef4444; color:#b91c1c; }
+
+/* ── Summary sidebar ── */
+.rq-summary-card {
+    background:#fff; border:1px solid #e5e7eb; border-radius:8px;
+    box-shadow:0 1px 4px rgba(0,0,0,0.06);
+    overflow-x:hidden; overflow-y:auto;
+    position:sticky; top:80px;
+    max-height:calc(100vh - 96px);
+}
+.rq-summary-head {
+    background:#8B0000;
+    padding:16px 18px; color:#fff;
+}
+.rq-summary-head-title { font-size:0.88rem; font-weight:800; margin:0; }
+.rq-summary-head-sub   { font-size:0.72rem; opacity:0.80; margin:2px 0 0; }
+.rq-summary-body { padding:16px 18px; }
+.rq-summary-row {
+    display:flex; align-items:flex-start; gap:8px;
+    padding:8px 0; border-bottom:1px solid rgba(0,0,0,0.06);
+    font-size:0.80rem;
+}
+.rq-summary-row:last-child { border-bottom:none; }
+.rq-summary-icon {
+    width:26px; height:26px; border-radius:7px;
+    background:rgba(139,0,0,0.08); color:var(--red);
+    display:flex; align-items:center; justify-content:center;
+    font-size:0.68rem; flex-shrink:0; margin-top:1px;
+}
+.rq-summary-label { font-size:0.67rem; font-weight:700; color:rgba(0,0,0,0.38); text-transform:uppercase; letter-spacing:0.3px; margin-bottom:2px; }
+.rq-summary-val   { font-weight:600; color:#1a1d23; }
+.rq-summary-empty { font-size:0.75rem; color:rgba(0,0,0,0.30); font-style:italic; }
+.rq-summary-tip {
+    font-size:0.74rem; color:rgba(0,0,0,0.42); line-height:1.5;
+    background:rgba(0,0,0,0.03); border-radius:10px; padding:10px 12px;
+    margin-top:12px;
+}
+
+/* Buttons */
+.rq-submit-btn {
+    background:#8B0000 !important;
+    border:none !important; border-radius:6px !important;
+    font-weight:700 !important; font-size:0.90rem !important;
+    color:#fff !important; padding:12px 28px !important;
+    transition:background 0.15s !important;
+}
+.rq-submit-btn:hover {
+    background:#7a0000 !important;
+}
+.rq-cancel-btn {
+    background:#f7f7f7 !important; border:1px solid #e5e7eb !important;
+    border-radius:6px !important; font-weight:600 !important;
+    color:#555 !important; padding:12px 22px !important;
+    transition:background 0.15s !important;
+}
+.rq-cancel-btn:hover { background:#e5e7eb !important; color:#111 !important; }
+
+/* Info chip for read-only desc */
+.rq-desc-chip {
+    background:rgba(139,0,0,0.05); border:1px solid rgba(139,0,0,0.12);
+    border-radius:10px; padding:9px 14px;
+    font-size:0.82rem; color:rgba(0,0,0,0.55); line-height:1.45;
+    display:flex; align-items:flex-start; gap:7px;
+}
+/* ── Cart ── */
+.rq-cart-area { margin-top:6px; }
+.rq-cart-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+.rq-cart-badge { background:rgba(139,0,0,0.10); color:#8B0000; border-radius:20px; padding:2px 10px; font-size:0.72rem; font-weight:800; }
+.rq-cart-empty { text-align:center; padding:20px 12px; color:rgba(0,0,0,0.30); font-size:0.81rem; background:rgba(0,0,0,0.02); border:1.5px dashed rgba(0,0,0,0.10); border-radius:12px; }
+.rq-cart-item { display:flex; align-items:flex-start; gap:10px; background:rgba(255,255,255,0.85); border:1px solid rgba(0,0,0,0.08); border-radius:12px; padding:11px 13px; margin-bottom:8px; }
+.rq-cart-item-num { width:24px; height:24px; border-radius:4px; flex-shrink:0; background:#8B0000; color:#fff; display:flex; align-items:center; justify-content:center; font-size:0.68rem; font-weight:800; }
+.rq-cart-item-body { flex:1; min-width:0; }
+.rq-cart-item-name { font-weight:700; color:#1a1d23; font-size:0.87rem; margin-bottom:3px; }
+.rq-cart-item-meta { font-size:0.75rem; color:rgba(0,0,0,0.44); display:flex; flex-wrap:wrap; gap:6px; }
+.rq-cart-remove { padding:3px 9px; border-radius:7px; border:none; background:rgba(239,68,68,0.09); color:#dc2626; font-size:0.72rem; font-weight:700; cursor:pointer; flex-shrink:0; }
+.rq-cart-remove:hover { background:rgba(239,68,68,0.20); }
+.rq-add-btn { display:flex; align-items:center; justify-content:center; gap:7px; width:100%; padding:10px; border-radius:11px; margin-top:10px; border:2px dashed rgba(139,0,0,0.25); background:rgba(139,0,0,0.03); color:#8B0000; font-size:0.84rem; font-weight:700; cursor:pointer; transition:all 0.15s; }
+.rq-add-btn:hover { background:rgba(139,0,0,0.08); border-color:rgba(139,0,0,0.50); }
+.rq-cart-error { display:none; color:#dc2626; font-size:0.80rem; font-weight:600; margin-top:8px; padding:8px 12px; background:rgba(239,68,68,0.08); border-radius:9px; }
+.rq-sum-preview-item { display:flex; align-items:flex-start; gap:7px; padding:5px 0; }
+.rq-sum-preview-num { display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:5px; background:rgba(139,0,0,0.12); color:#8B0000; font-size:0.60rem; font-weight:800; flex-shrink:0; margin-top:1px; }
+
+/* ── Item Availability Calendar ── */
+.iac-outer {
+    border-top: 1px solid #e5e7eb;
+    border-radius: 0 0 12px 12px;
+    overflow: hidden;
+    background: #fafafa;
+}
+.iac-bar {
+    padding: 11px 16px;
+    font-size: 0.80rem;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    line-height: 1.5;
+}
+.iac-bar-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.82rem;
+}
+.iac-bar-chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px;
+}
+.iac-bar-chips-label {
+    font-size: 0.70rem;
+    color: #a16207;
+    font-weight: 600;
+    margin-right: 2px;
+}
+.iac-ret-chip {
+    font-size: 0.70rem;
+    font-weight: 600;
+    background: #fef3c7;
+    color: #92400e;
+    border: 1px solid #fbbf24;
+    border-radius: 20px;
+    padding: 2px 9px;
+    white-space: nowrap;
+}
+.iac-ret-chip.iac-ret-chip-overdue {
+    background: #fee2e2;
+    color: #b91c1c;
+    border-color: #f87171;
+}
+.iac-bar-borrowed {
+    background: linear-gradient(135deg, #fff8ed 0%, #fff3e0 100%);
+    color: #7c4a00;
+    border-bottom: 1px solid #fde68a;
+}
+.iac-bar-overdue {
+    background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+    color: #7f1d1d;
+    border-bottom: 1px solid #fca5a5;
+}
+.iac-cal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px 0;
+}
+.iac-cal-title {
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #8B0000;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.iac-cal-nav {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.iac-cal-nav span {
+    font-weight: 700;
+    font-size: 0.85rem;
+    color: #111;
+    min-width: 100px;
+    text-align: center;
+}
+.iac-cal-nav button {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    width: 28px; height: 28px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; color: #555; font-size: 0.65rem;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    transition: background 0.15s, border-color 0.15s;
+}
+.iac-cal-nav button:hover { background: #f3f4f6; border-color: #d1d5db; }
+.iac-cal-panel { padding: 10px 14px 6px; }
+.iac-grid {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    gap: 4px;
+}
+.iac-dow {
+    text-align: center;
+    font-size: 0.58rem;
+    font-weight: 700;
+    color: #9ca3af;
+    padding: 4px 0 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.iac-cell {
+    text-align: center;
+    font-size: 0.73rem;
+    padding: 6px 2px 5px;
+    border-radius: 7px;
+    line-height: 1.2;
+    color: #374151;
+    transition: transform 0.1s;
+}
+.iac-cell:not(:empty):hover { transform: scale(1.12); }
+.iac-cell.iac-past { color: #d1d5db; }
+.iac-cell.iac-today {
+    font-weight: 800;
+    outline: 2px solid #8B0000;
+    outline-offset: -2px;
+    border-radius: 7px;
+}
+.iac-cell.iac-unavail {
+    background: #fee2e2;
+    color: #b91c1c;
+    text-decoration: line-through;
+    text-decoration-color: #f87171;
+}
+.iac-cell.iac-today.iac-unavail {
+    background: #fca5a5;
+    color: #7f1d1d;
+    outline-color: #dc2626;
+}
+.iac-cell.iac-returns {
+    background: linear-gradient(135deg, #fef9c3, #fef3c7);
+    color: #92400e;
+    font-weight: 700;
+    border: 1px solid #fbbf24;
+    box-shadow: 0 1px 3px rgba(251,191,36,0.25);
+    position: relative;
+}
+.iac-cell.iac-returns::after {
+    content: '↵';
+    display: block;
+    font-size: 0.52rem;
+    line-height: 1;
+    color: #d97706;
+    margin-top: 1px;
+}
+.iac-cell.iac-overdue {
+    background: linear-gradient(135deg, #fee2e2, #fecaca);
+    color: #991b1b;
+    font-weight: 700;
+    border: 1px solid #f87171;
+    box-shadow: 0 1px 3px rgba(248,113,113,0.35);
+    position: relative;
+}
+.iac-cell.iac-overdue::after {
+    content: '!';
+    display: block;
+    font-size: 0.58rem;
+    line-height: 1;
+    color: #b91c1c;
+    margin-top: 1px;
+    font-weight: 900;
+}
+.iac-cell.iac-today.iac-overdue {
+    background: #dc2626;
+    color: #fff;
+    outline-color: #dc2626;
+}
+.iac-cell.iac-today.iac-overdue::after {
+    color: #fff;
+}
+.iac-cell.iac-avail {
+    background: #dcfce7;
+    color: #15803d;
+    font-weight: 600;
+}
+.iac-cell.iac-today.iac-avail {
+    background: #8B0000;
+    color: #fff;
+    outline-color: #8B0000;
+}
+.iac-cell.iac-today:not(.iac-unavail):not(.iac-returns):not(.iac-avail) {
+    background: #8B0000;
+    color: #fff;
+    outline-color: #8B0000;
+}
+.iac-legend {
+    display: flex;
+    gap: 8px;
+    padding: 8px 14px 12px;
+    border-top: 1px solid #f0f0f0;
+    flex-wrap: wrap;
+    justify-content: center;
+}
+.iac-leg-item {
+    font-size: 0.68rem;
+    color: #6b7280;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 20px;
+    padding: 3px 9px;
+}
+.iac-leg-dot {
+    width: 9px; height: 9px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    display: inline-block;
+}
+
+/* ── Borrow Item Shop ── */
+.bshop-wrap { display:flex; flex-direction:column; gap:10px; }
+
+.bshop-controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+.bshop-search-wrap {
+    position: relative;
+    flex: 1;
+}
+.bshop-search-wrap input {
+    width: 100%;
+    padding: 8px 12px 8px 34px;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    font-size: 0.83rem;
+    outline: none;
+    background: #fafafa;
+    transition: border-color 0.15s, background 0.15s;
+    color: #1a1d23;
+}
+.bshop-search-wrap input:focus { border-color: #8B0000; background: #fff; }
+.bshop-search-icon {
+    position: absolute; left: 11px; top: 50%; transform: translateY(-50%);
+    color: #aaa; font-size: 0.75rem; pointer-events: none;
+}
+
+.bshop-cats {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.bshop-cat {
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 5px 12px;
+    border-radius: 20px;
+    border: 1px solid #e5e7eb;
+    background: #fff;
+    color: #555;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+.bshop-cat:hover { border-color: #8B0000; color: #8B0000; }
+.bshop-cat.active { background: #8B0000; border-color: #8B0000; color: #fff; }
+
+.bshop-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    max-height: 460px;
+    overflow-y: auto;
+    padding-right: 2px;
+}
+@media(max-width:900px){ .bshop-grid { grid-template-columns: repeat(2,1fr); } }
+@media(max-width:560px){ .bshop-grid { grid-template-columns: 1fr; } }
+.bshop-grid::-webkit-scrollbar { width: 5px; }
+.bshop-grid::-webkit-scrollbar-track { background: transparent; }
+.bshop-grid::-webkit-scrollbar-thumb { background: #e5e7eb; border-radius: 4px; }
+
+.bshop-card {
+    position: relative;
+    background: #fff;
+    border: 1.5px solid #e5e7eb;
+    border-radius: 10px;
+    padding: 12px 12px 10px;
+    cursor: pointer;
+    transition: border-color 0.15s, box-shadow 0.15s, transform 0.1s;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    user-select: none;
+}
+.bshop-card:hover {
+    border-color: rgba(139,0,0,0.35);
+    box-shadow: 0 2px 8px rgba(139,0,0,0.08);
+    transform: translateY(-1px);
+}
+.bshop-card.bshop-selected {
+    border-color: #8B0000;
+    border-width: 2px;
+    background: rgba(139,0,0,0.025);
+    box-shadow: 0 0 0 3px rgba(139,0,0,0.10);
+}
+
+.bshop-check {
+    position: absolute;
+    top: 8px; right: 8px;
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    background: #8B0000;
+    color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.55rem;
+    opacity: 0;
+    transform: scale(0.5);
+    transition: all 0.18s;
+    z-index: 2;
+}
+.bshop-card.bshop-selected .bshop-check { opacity: 1; transform: scale(1); }
+
+.bshop-avail-badge {
+    position: absolute;
+    top: 8px; left: 8px;
+    font-size: 0.62rem;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 10px;
+    line-height: 1.6;
+}
+.bshop-avail-ok   { background: #dcfce7; color: #15803d; }
+.bshop-avail-none { background: #fee2e2; color: #991b1b; }
+.bshop-card.bshop-disabled { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
+
+.bshop-icon {
+    width: 34px; height: 34px;
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.95rem;
+    margin-top: 20px;
+    flex-shrink: 0;
+}
+.bshop-icon-custom { background: #f3f4f6; color: #6b7280; }
+
+.bshop-name {
+    font-size: 0.84rem;
+    font-weight: 800;
+    color: #1a1d23;
+    line-height: 1.3;
+    margin-top: 6px;
+}
+.bshop-desc {
+    font-size: 0.71rem;
+    color: #9ca3af;
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.bshop-loc {
+    font-size: 0.68rem;
+    color: #bbb;
+    margin-top: 2px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.bshop-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #f3f4f6;
+}
+.bshop-price {
+    font-size: 0.80rem;
+    font-weight: 700;
+    color: #374151;
+    font-variant-numeric: tabular-nums;
+}
+.bshop-status-pill {
+    font-size: 0.63rem;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+.bshop-pill-avail    { background: #dcfce7; color: #15803d; }
+.bshop-pill-borrowed { background: #fef3c7; color: #92400e; }
+.bshop-pill-maint    { background: #e0f2fe; color: #0369a1; }
+.bshop-pill-damaged  { background: #fee2e2; color: #991b1b; }
+.bshop-avail-maint   { background: #e0f2fe; color: #0369a1; }
+.bshop-pill-custom   { background: #f3f4f6; color: #6b7280; }
+
+.bshop-card-custom {
+    border-style: dashed;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    min-height: 120px;
+}
+.bshop-card-custom .bshop-icon { margin-top: 0; }
+.bshop-card-custom .bshop-foot { border-top: none; padding-top: 0; margin-top: 4px; justify-content: center; }
+
+.bshop-empty {
+    grid-column: 1/-1;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    color: #bbb;
+    font-size: 0.82rem;
+    padding: 24px;
+    display: flex;
+}
+
+/* Shop grid pagination — client-side, applied on top of whatever search/
+   category filters are active (see filterShopItems()/renderBshopPage()). */
+.bshop-pagination { display:flex; justify-content:center; align-items:center; flex-wrap:wrap; gap:6px; margin-top:16px; }
+.bshop-pagination button {
+    min-width:32px; height:32px; padding:0 8px; border-radius:6px;
+    font-size:0.82rem; font-weight:700; cursor:pointer;
+    background:#f7f7f7; color:#555; border:1px solid #e5e7eb;
+}
+.bshop-pagination button:hover { background:#eee; }
+.bshop-pagination button.active { background:#8B0000; color:#fff; border-color:#8B0000; }
+.bshop-pagination button:disabled { opacity:0.4; cursor:default; }
+.bshop-pagination button:disabled:hover { background:#f7f7f7; }
+</style>
+
+<div class="container-fluid mt-4 pb-4">
+
+    <?php if (isset($error)): ?>
+    <div class="alert alert-danger mb-4" style="border-radius:14px;">
+        <i class="fas fa-exclamation-circle me-2"></i><?php echo $error; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Step Indicator -->
+    <div class="rq-steps mb-4">
+        <div class="rq-step-item">
+            <div class="rq-step-dot done" id="sdot1"><i class="fas fa-check" style="font-size:0.65rem;"></i></div>
+            <div class="rq-step-lbl done" id="slbl1">Request Type</div>
+        </div>
+        <div class="rq-step-connector done" id="scon1"></div>
+        <div class="rq-step-item">
+            <div class="rq-step-dot active" id="sdot2">2</div>
+            <div class="rq-step-lbl active" id="slbl2">Urgency</div>
+        </div>
+        <div class="rq-step-connector" id="scon2"></div>
+        <div class="rq-step-item">
+            <div class="rq-step-dot" id="sdot3">3</div>
+            <div class="rq-step-lbl" id="slbl3">Details</div>
+        </div>
+    </div>
+
+    <!-- Step 1 — Type Selection -->
+    <div id="step1_section">
+        <div class="rq-type-grid mb-4">
+            <label class="rq-type-card selected" id="typeCardBorrow" onclick="selectType(this,'borrow')">
+                <input type="radio" name="_type_vis" value="borrow" checked>
+                <div class="rq-type-check"><i class="fas fa-check"></i></div>
+                <div class="rq-type-icon" style="color:#1d4ed8;">
+                    <i class="fas fa-hand-holding"></i>
+                </div>
+                <h6><?php echo termLabel("Borrow"); ?> Item</h6>
+                <p>Temporarily borrow an item from inventory</p>
+            </label>
+            <label class="rq-type-card" id="typeCardItem" onclick="selectType(this,'item')">
+                <input type="radio" name="_type_vis" value="item">
+                <div class="rq-type-check"><i class="fas fa-check"></i></div>
+                <div class="rq-type-icon" style="color:#15803d;">
+                    <i class="fas fa-shopping-cart"></i>
+                </div>
+                <h6><?php echo termLabel("Request Item"); ?></h6>
+                <p>Request a new item to be procured or purchased</p>
+            </label>
+            <label class="rq-type-card" onclick="selectType(this,'service')">
+                <input type="radio" name="_type_vis" value="service">
+                <div class="rq-type-check"><i class="fas fa-check"></i></div>
+                <div class="rq-type-icon" style="color:#b45309;">
+                    <i class="fas fa-tools"></i>
+                </div>
+                <h6>Request Service</h6>
+                <p>Request maintenance, repair or inspection</p>
+            </label>
+        </div>
+    </div>
+
+    <!-- Form + Sidebar -->
+    <div class="rq-layout">
+
+        <!-- Form Card -->
+        <div class="rq-form-card">
+            <!-- Dynamic head -->
+            <div class="rq-form-head" id="formHead">
+                <div class="rq-form-head-icon" id="formHeadIcon"
+                     style="color:#1d4ed8;">
+                    <i class="fas fa-hand-holding"></i>
+                </div>
+                <div>
+                    <div class="rq-form-head-title" id="formHeadTitle"><?php echo termLabel("Borrow"); ?> Item</div>
+                    <div class="rq-form-head-sub"  id="formHeadSub">Fill in the details for your <?php echo strtolower(termLabel("Borrow")); ?> request</div>
+                </div>
+            </div>
+
+            <div class="rq-form-body">
+            <form method="POST" action="" id="requestForm" novalidate enctype="multipart/form-data">
+                <input type="hidden" id="request_type_hidden" name="request_type" value="borrow">
+
+                <!-- Urgency -->
+                <div class="rq-section-title"><i class="fas fa-bolt"></i> Priority Level</div>
+                <div class="urgency-group mb-4">
+                    <?php
+                    $urgencies = [
+                        'low'      => ['label' => 'Low',      'icon' => 'fa-arrow-down',   'class' => 'selected-low'],
+                        'medium'   => ['label' => 'Medium',   'icon' => 'fa-minus',        'class' => 'selected-medium'],
+                        'high'     => ['label' => 'High',     'icon' => 'fa-arrow-up',     'class' => 'selected-high'],
+                        'critical' => ['label' => 'Critical', 'icon' => 'fa-exclamation',  'class' => 'selected-critical'],
+                    ];
+                    foreach ($urgencies as $val => $u): ?>
+                    <label class="urgency-pill <?php echo $val === 'medium' ? 'selected-medium' : ''; ?>"
+                           data-urgency="<?php echo $val; ?>"
+                           onclick="selectUrgency(this,'<?php echo $u['class']; ?>')">
+                        <input type="radio" name="urgency" value="<?php echo $val; ?>" <?php echo $val === 'medium' ? 'checked' : ''; ?>>
+                        <i class="fas <?php echo $u['icon']; ?>"></i>
+                        <?php echo $u['label']; ?>
+                    </label>
+                    <?php endforeach; ?>
+                </div>
+
+                <hr class="rq-divider">
+
+                <!-- BORROW FIELDS -->
+                <div id="borrow_fields">
+                    <div class="rq-section-title"><i class="fas fa-hand-holding"></i> <?php echo termLabel("Borrow"); ?> Details</div>
+
+                    <?php
+                    // Category icon + color map
+                    $catMeta = [
+                        'Electronics'      => ['icon'=>'fa-laptop',              'color'=>'#1e40af','bg'=>'#dbeafe'],
+                        'Furniture'        => ['icon'=>'fa-chair',               'color'=>'#92400e','bg'=>'#fef3c7'],
+                        'Equipment'        => ['icon'=>'fa-screwdriver-wrench',  'color'=>'#166534','bg'=>'#dcfce7'],
+                        'Supplies'         => ['icon'=>'fa-boxes-stacked',       'color'=>'#6b21a8','bg'=>'#f3e8ff'],
+                        'Appliances'       => ['icon'=>'fa-plug',                'color'=>'#0f766e','bg'=>'#ccfbf1'],
+                        'Security'         => ['icon'=>'fa-shield-halved',       'color'=>'#9f1239','bg'=>'#ffe4e6'],
+                        'Office Equipment' => ['icon'=>'fa-print',               'color'=>'#0369a1','bg'=>'#e0f2fe'],
+                    ];
+                    $defaultMeta = ['icon'=>'fa-box','color'=>'#6b7280','bg'=>'#f3f4f6'];
+                    ?>
+
+                    <div class="rq-field">
+                        <label>Item to <?php echo termLabel("Borrow"); ?> <span class="rq-req">*</span><?php if ($auto_fill_item): ?> <span style="font-size:0.65rem;font-weight:700;background:rgba(34,197,94,0.12);color:#15803d;padding:2px 8px;border-radius:12px;border:1px solid rgba(34,197,94,0.22);margin-left:6px;"><i class="fas fa-check-circle me-1"></i>Pre-selected</span><?php endif; ?></label>
+
+                        <!-- Hidden select (drives existing JS logic unchanged) -->
+                        <select id="borrow_catalog_select" name="borrow_item_name" style="display:none;" required>
+                            <option value="">— Select an item —</option>
+                            <?php foreach ($borrow_catalog as $category => $groups):
+                                if (!count($groups)) continue; ?>
+                            <optgroup label="<?php echo htmlspecialchars($category); ?>">
+                                <?php foreach ($groups as $ci): ?>
+                                <option value="<?php echo htmlspecialchars($ci['item_name']); ?>"
+                                        data-item-id="<?php echo $ci['first_available_id']; ?>"
+                                        data-status="<?php echo $ci['available_count'] > 0 ? 'available' : 'borrowed'; ?>"
+                                        data-quantity="<?php echo count($ci['units']); ?>"
+                                        data-available="<?php echo $ci['available_count']; ?>"
+                                        data-unit-ids="<?php echo htmlspecialchars(json_encode($ci['available_unit_ids'])); ?>"
+                                        data-all-unit-ids="<?php echo htmlspecialchars(json_encode(array_column($ci['units'], 'id'))); ?>"
+                                        <?php if ($auto_fill_item && $ci['item_name'] === $auto_fill_item) echo 'selected'; ?>>
+                                    <?php echo htmlspecialchars($ci['item_name']); ?>
+                                </option>
+                                <?php endforeach; ?>
+                            </optgroup>
+                            <?php endforeach; ?>
+                        </select>
+
+                        <!-- Shop UI -->
+                        <div class="bshop-wrap">
+                            <!-- Search -->
+                            <div class="bshop-controls">
+                                <div class="bshop-search-wrap">
+                                    <i class="fas fa-search bshop-search-icon"></i>
+                                    <input type="text" id="bshop-search" placeholder="Search items…" oninput="filterShopItems()">
+                                </div>
+                            </div>
+                            <!-- Category pills -->
+                            <div class="bshop-cats" id="bshop-cats">
+                                <button type="button" class="bshop-cat active" data-cat="" onclick="filterShopItems(this)">All</button>
+                                <?php foreach (array_keys($borrow_catalog) as $cat): ?>
+                                <button type="button" class="bshop-cat" data-cat="<?php echo htmlspecialchars($cat); ?>" onclick="filterShopItems(this)"><?php echo htmlspecialchars($cat); ?></button>
+                                <?php endforeach; ?>
+                            </div>
+                            <!-- Card grid -->
+                            <div class="bshop-grid" id="bshop-grid">
+                                <?php foreach ($borrow_catalog as $category => $groups):
+                                    foreach ($groups as $ci):
+                                        $availableQty  = $ci['available_count'];
+                                        $totalUnits    = count($ci['units']);
+                                        $firstUnit     = $ci['units'][0];
+                                        $retDates = [];
+                                        foreach ($ci['return_records'] as $r) {
+                                            $retDates[] = date('M j', strtotime($r['return_date']));
+                                        }
+                                        sort($retDates);
+                                        $retDates = array_unique($retDates);
+                                        $meta = $catMeta[$category] ?? $defaultMeta;
+                                        $isPreSelected = ($auto_fill_item && $ci['item_name'] === $auto_fill_item);
+                                ?>
+                                <div class="bshop-card<?php echo $isPreSelected ? ' bshop-selected' : ''; ?>"
+                                     data-value="<?php echo htmlspecialchars($ci['item_name']); ?>"
+                                     data-item-id="<?php echo $ci['first_available_id']; ?>"
+                                     data-status="<?php echo $availableQty > 0 ? 'available' : 'borrowed'; ?>"
+                                     data-category="<?php echo htmlspecialchars($category); ?>"
+                                     data-available="<?php echo $availableQty; ?>"
+                                     data-quantity="<?php echo $totalUnits; ?>"
+                                     data-unit-ids="<?php echo htmlspecialchars(json_encode($ci['available_unit_ids'])); ?>"
+                                     onclick="selectBorrowCard(this)">
+                                    <div class="bshop-check"><i class="fas fa-check"></i></div>
+                                    <div class="bshop-avail-badge <?php echo $availableQty > 0 ? 'bshop-avail-ok' : 'bshop-avail-none'; ?>">
+                                        <?php echo $availableQty > 0 ? $availableQty . ' avail.' : 'Fully ' . strtolower(termLabel('Borrowed')); ?>
+                                    </div>
+                                    <div class="bshop-icon" style="background:<?php echo $meta['bg']; ?>;color:<?php echo $meta['color']; ?>;">
+                                        <i class="fas <?php echo $meta['icon']; ?>"></i>
+                                    </div>
+                                    <div class="bshop-name"><?php echo htmlspecialchars($ci['item_name']); ?></div>
+                                    <?php $__borrow_acq = acquisitionModeBadge($firstUnit['acquisition_mode'] ?? 'borrow'); ?>
+                                    <span style="font-size:0.65rem;font-weight:700;padding:1px 7px;border-radius:10px;display:inline-block;margin-bottom:4px;
+                                                 background:<?php echo $__borrow_acq['bg']; ?>;color:<?php echo $__borrow_acq['fg']; ?>;">
+                                        <?php echo htmlspecialchars($__borrow_acq['label']); ?>
+                                    </span>
+                                    <div class="bshop-desc"><?php echo htmlspecialchars($ci['description'] ?: ($firstUnit['description'] ?? '')); ?></div>
+                                    <div class="bshop-loc"><i class="fas fa-location-dot"></i> <?php echo htmlspecialchars($firstUnit['location'] ?? ''); ?></div>
+                                    <div class="bshop-foot">
+                                        <div class="bshop-price">₱<?php echo number_format($firstUnit['cost'] ?? 0, 2); ?></div>
+                                        <div class="bshop-status-pill <?php echo $availableQty === 0 ? 'bshop-pill-borrowed' : 'bshop-pill-avail'; ?>">
+                                            <?php if ($availableQty === 0 && count($retDates) > 0): ?>
+                                                Returns <?php echo $retDates[0]; ?>
+                                            <?php elseif ($availableQty === 0): ?>
+                                                <?php echo termLabel("Borrowed"); ?>
+                                            <?php else: ?>
+                                                <?php echo $totalUnits; ?> unit<?php echo $totalUnits > 1 ? 's' : ''; ?>
+                                            <?php endif; ?>
+                                        </div>
+                                    </div>
+                                </div>
+                                <?php endforeach; endforeach; ?>
+                                <div id="bshop-empty" class="bshop-empty" style="display:none;">
+                                    <i class="fas fa-search"></i><span>No items match</span>
+                                </div>
+                            </div>
+                            <div id="bshop-pagination" class="bshop-pagination"></div>
+                        </div>
+                    </div>
+
+                    <div class="row g-3 mb-2">
+                        <div class="col-sm-4">
+                            <div class="rq-field mb-0">
+                                <label>Date Needed</label>
+                                <div class="rq-input-wrap">
+                                    <i class="fas fa-calendar rq-input-icon"></i>
+                                    <input type="date" class="form-control" id="borrow_date_needed"
+                                           name="borrow_date_needed" min="<?php echo appToday(); ?>" onchange="updateSummary()">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-sm-4">
+                            <div class="rq-field mb-0">
+                                <label>Expected Return Date <span class="rq-req">*</span></label>
+                                <div class="rq-input-wrap">
+                                    <i class="fas fa-calendar rq-input-icon"></i>
+                                    <input type="date" class="form-control" id="expected_return_date"
+                                           name="expected_return_date" required min="<?php echo appToday(); ?>" onchange="updateSummary()">
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-sm-4">
+                            <div class="rq-field mb-0">
+                                <label>Quantity <span class="rq-req">*</span></label>
+                                <div class="rq-input-wrap">
+                                    <i class="fas fa-hashtag rq-input-icon"></i>
+                                    <input type="number" class="form-control" id="borrow_quantity"
+                                           name="borrow_quantity" value="1" min="1" required
+                                           oninput="clampQtyInput(this); updateSummary()">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="rq-field mt-3">
+                        <label>Reason for <?php echo termLabel("Borrowing"); ?></label>
+                        <div class="rq-input-wrap">
+                            <i class="fas fa-comment rq-input-icon rq-input-icon-ta"></i>
+                            <textarea class="form-control" id="reason" name="reason" rows="3"
+                                      placeholder="Briefly explain why you need this item"
+                                      oninput="updateSummary()"></textarea>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ITEM REQUEST FIELDS -->
+                <div id="item_fields" style="display:none;">
+                    <div class="rq-section-title"><i class="fas fa-shopping-cart"></i> Item <?php echo termLabel("Request"); ?> Details</div>
+
+                    <div class="rq-field">
+                        <label>Item Name <span class="rq-req">*</span></label>
+
+                        <!-- Hidden select (drives handleItemCatalogChange) -->
+                        <select id="item_description" name="item_description" style="display:none;">
+                            <option value="">— Select an item —</option>
+                            <option value="__custom__">Other (custom)</option>
+                            <?php foreach ($catalog_by_category as $category => $groups): ?>
+                            <optgroup label="<?php echo htmlspecialchars($category); ?>">
+                                <?php foreach ($groups as $ci): ?>
+                                <option value="<?php echo htmlspecialchars($ci['item_name']); ?>"
+                                        data-desc="<?php echo htmlspecialchars($ci['description'] ?: ($ci['units'][0]['description'] ?? '')); ?>">
+                                    <?php echo htmlspecialchars($ci['item_name']); ?>
+                                </option>
+                                <?php endforeach; ?>
+                            </optgroup>
+                            <?php endforeach; ?>
+                        </select>
+
+                        <!-- Shop grid -->
+                        <div class="bshop-wrap">
+                            <div class="bshop-controls">
+                                <div class="bshop-search-wrap">
+                                    <i class="fas fa-search bshop-search-icon"></i>
+                                    <input type="text" id="ishop-search" placeholder="Search items…" oninput="filterItemShop()">
+                                </div>
+                            </div>
+                            <div class="bshop-cats" id="ishop-cats">
+                                <button type="button" class="bshop-cat active" data-cat="" onclick="filterItemShop(this)">All</button>
+                                <?php foreach (array_keys($catalog_by_category) as $cat): ?>
+                                <button type="button" class="bshop-cat" data-cat="<?php echo htmlspecialchars($cat); ?>" onclick="filterItemShop(this)"><?php echo htmlspecialchars($cat); ?></button>
+                                <?php endforeach; ?>
+                            </div>
+                            <div class="bshop-grid" id="ishop-grid">
+                                <!-- Custom card — placed first so it's always easy to find,
+                                     instead of buried after however many catalog items there are. -->
+                                <div class="bshop-card bshop-card-custom"
+                                     data-value="__custom__" data-category="" data-desc=""
+                                     onclick="selectItemReqCard(this)">
+                                    <div class="bshop-check"><i class="fas fa-check"></i></div>
+                                    <div class="bshop-icon bshop-icon-custom"><i class="fas fa-pen"></i></div>
+                                    <div class="bshop-name">Other / Custom</div>
+                                    <div class="bshop-desc">Specify an item not in the list</div>
+                                    <div class="bshop-foot"><div class="bshop-status-pill bshop-pill-custom">Custom</div></div>
+                                </div>
+                                <?php foreach ($catalog_by_category as $category => $groups):
+                                    foreach ($groups as $ci):
+                                        $meta      = $catMeta[$category] ?? $defaultMeta;
+                                        $firstUnit = $ci['units'][0];
+                                        $avail_units_ir = array_values(array_filter($ci['units'], fn($u) => $u['status'] === 'available'));
+                                        $availableCount = count($avail_units_ir);
+                                        $desc = $ci['description'] ?: ($firstUnit['description'] ?? '');
+                                ?>
+                                <div class="bshop-card<?php echo $availableCount === 0 ? ' bshop-disabled' : ''; ?>"
+                                     data-value="<?php echo htmlspecialchars($ci['item_name']); ?>"
+                                     data-category="<?php echo htmlspecialchars($category); ?>"
+                                     data-desc="<?php echo htmlspecialchars($desc); ?>"
+                                     data-total="<?php echo $availableCount; ?>"
+                                     data-first-unit-id="<?php echo ($avail_units_ir[0] ?? $firstUnit)['id']; ?>"
+                                     data-group-id="<?php echo htmlspecialchars($ci['group_id'] ?? ''); ?>"
+                                     data-unit-ids="<?php echo htmlspecialchars(json_encode(array_column($avail_units_ir, 'id'))); ?>"
+                                     onclick="<?php echo $availableCount === 0 ? '' : 'selectItemReqCard(this)'; ?>">
+                                    <div class="bshop-check"><i class="fas fa-check"></i></div>
+                                    <div class="bshop-avail-badge <?php echo $availableCount > 0 ? 'bshop-avail-ok' : 'bshop-avail-none'; ?>">
+                                        <?php echo $availableCount > 0 ? $availableCount . ' available' : 'None available'; ?>
+                                    </div>
+                                    <div class="bshop-icon" style="background:<?php echo $meta['bg']; ?>;color:<?php echo $meta['color']; ?>;">
+                                        <i class="fas <?php echo $meta['icon']; ?>"></i>
+                                    </div>
+                                    <div class="bshop-name"><?php echo htmlspecialchars($ci['item_name']); ?></div>
+                                    <?php $__acq_badge = acquisitionModeBadge($firstUnit['acquisition_mode'] ?? 'borrow'); ?>
+                                    <span style="font-size:0.65rem;font-weight:700;padding:1px 7px;border-radius:10px;display:inline-block;margin-bottom:4px;
+                                                 background:<?php echo $__acq_badge['bg']; ?>;color:<?php echo $__acq_badge['fg']; ?>;">
+                                        <?php echo htmlspecialchars($__acq_badge['label']); ?>
+                                    </span>
+                                    <div class="bshop-desc"><?php echo htmlspecialchars($desc); ?></div>
+                                    <div class="bshop-loc"><i class="fas fa-location-dot"></i> <?php echo htmlspecialchars($firstUnit['location'] ?? ''); ?></div>
+                                    <div class="bshop-foot">
+                                        <div class="bshop-price">₱<?php echo number_format($firstUnit['cost'] ?? 0, 2); ?></div>
+                                        <div class="bshop-status-pill bshop-pill-avail"><?php echo htmlspecialchars($category); ?></div>
+                                    </div>
+                                </div>
+                                <?php endforeach; endforeach; ?>
+                                <div id="ishop-empty" class="bshop-empty" style="display:none;">
+                                    <i class="fas fa-search"></i><span>No items match</span>
+                                </div>
+                            </div>
+                            <div id="ishop-pagination" class="bshop-pagination"></div>
+                        </div>
+                    </div>
+
+                    <div class="rq-field" id="custom_item_req_wrap" style="display:none;">
+                        <label>Custom Item Name <span class="rq-req">*</span></label>
+                        <div class="rq-input-wrap">
+                            <i class="fas fa-pen rq-input-icon"></i>
+                            <input type="text" class="form-control" id="custom_item_req_name"
+                                   name="custom_item_req_name"
+                                   placeholder="e.g., Canon Projector, Dell Desktop Computer"
+                                   oninput="updateSummary()">
+                        </div>
+                    </div>
+
+                    <div class="rq-field" id="item_desc_display_wrap" style="display:none;">
+                        <label>Item Description</label>
+                        <div class="rq-desc-chip" id="item_desc_chip">
+                            <i class="fas fa-info-circle" style="color:var(--red);flex-shrink:0;margin-top:2px;"></i>
+                            <span id="item_desc_display_text"></span>
+                        </div>
+                        <input type="hidden" id="item_desc_display" name="item_desc_detail">
+                    </div>
+
+                    <div style="display:flex;gap:14px;flex-wrap:wrap;">
+                        <div class="rq-field" style="max-width:160px;">
+                            <label>Quantity <span class="rq-req">*</span></label>
+                            <div class="rq-input-wrap">
+                                <i class="fas fa-hashtag rq-input-icon"></i>
+                                <input type="number" class="form-control" id="quantity" name="quantity"
+                                       value="1" min="1" oninput="clampQtyInput(this); updateSummary()">
+                            </div>
+                        </div>
+
+                        <div class="rq-field" style="max-width:220px;">
+                            <label>Date Needed</label>
+                            <div class="rq-input-wrap">
+                                <i class="fas fa-calendar rq-input-icon"></i>
+                                <input type="date" class="form-control" id="item_date_needed" name="item_date_needed" min="<?php echo appToday(); ?>" oninput="updateSummary()">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="rq-field">
+                        <label>Reason for <?php echo termLabel("Request"); ?> <span class="rq-req">*</span></label>
+                        <div class="rq-input-wrap">
+                            <i class="fas fa-comment rq-input-icon rq-input-icon-ta"></i>
+                            <textarea class="form-control" id="item_reason" name="reason" rows="3"
+                                      placeholder="Explain why this item is needed, where it will be used, etc."
+                                      oninput="updateSummary()"></textarea>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- SERVICE FIELDS -->
+                <div id="service_fields" style="display:none;">
+                    <div class="rq-section-title"><i class="fas fa-tools"></i> Service Request Details</div>
+
+                    <div class="rq-field">
+                        <label>What needs service? <span class="rq-req">*</span></label>
+                        <div class="rq-input-wrap">
+                            <i class="fas fa-box rq-input-icon"></i>
+                            <input type="text" class="form-control" id="service_subject" name="service_subject"
+                                   placeholder="e.g., Aircon in Room 204, CCS Server Rack"
+                                   oninput="updateSummary()">
+                        </div>
+                    </div>
+
+                    <div style="display:flex;gap:14px;flex-wrap:wrap;">
+                        <div class="rq-field" style="flex:1;min-width:180px;">
+                            <label>Type of Service <span class="rq-req">*</span></label>
+                            <div class="rq-input-wrap">
+                                <i class="fas fa-wrench rq-input-icon"></i>
+                                <select class="form-select" id="service_type" name="service_type"
+                                        onchange="updateSummary()">
+                                    <option value="">— Select service type —</option>
+                                    <option value="repair">🔧 Repair</option>
+                                    <option value="maintenance">🛠️ Maintenance</option>
+                                    <option value="inspection">🔍 Inspection</option>
+                                    <option value="cleaning">🧹 Cleaning</option>
+                                    <option value="other">📋 Other</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="rq-field" style="max-width:220px;">
+                            <label>Date Needed</label>
+                            <div class="rq-input-wrap">
+                                <i class="fas fa-calendar rq-input-icon"></i>
+                                <input type="date" class="form-control" id="service_date_needed" name="service_date_needed" min="<?php echo appToday(); ?>" oninput="updateSummary()">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="rq-field">
+                        <label>Service Description <span class="rq-req">*</span></label>
+                        <div class="rq-input-wrap">
+                            <i class="fas fa-align-left rq-input-icon rq-input-icon-ta"></i>
+                            <textarea class="form-control" id="service_description"
+                                      name="service_description" rows="3"
+                                      placeholder="Describe the issue or service needed in detail."
+                                      oninput="updateSummary()"></textarea>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ─── CART / ITEMS LIST ─── -->
+                <div id="rq-cart-area" class="rq-cart-area">
+                    <div class="rq-cart-header">
+                        <div class="rq-section-title" style="margin-bottom:0;flex:1;"><i class="fas fa-list-ul"></i> Items in This Request</div>
+                        <span id="cart-count-badge" class="rq-cart-badge">0</span>
+                    </div>
+                    <div id="rq-cart-list">
+                        <div class="rq-cart-empty"><i class="fas fa-inbox" style="font-size:1.5rem;display:block;margin-bottom:8px;opacity:0.22;"></i>No items added yet. Fill in the details above and click <strong>Add to List</strong>.</div>
+                    </div>
+                    <div id="cart-error" class="rq-cart-error"></div>
+                    <button type="button" class="rq-add-btn" onclick="addToCart()">
+                        <i class="fas fa-plus-circle"></i> Add to List
+                    </button>
+                </div>
+
+                <hr class="rq-divider">
+
+                <!-- RECEIVING METHOD -->
+                <div id="receiving_method_section">
+                    <div class="rq-section-title"><i class="fas fa-truck"></i> Receiving Method</div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:4px;" id="receiving_method_grid">
+                        <label class="rq-type-card selected" id="rm-delivery" onclick="selectReceivingMethod('delivery',this)" style="cursor:pointer;">
+                            <input type="radio" name="receiving_method" value="delivery" checked>
+                            <div class="rq-type-check"><i class="fas fa-check"></i></div>
+                            <div style="display:flex;align-items:center;gap:10px;">
+                                <div class="rq-type-icon" style="color:#1d4ed8;width:32px;height:32px;min-width:32px;font-size:1rem;margin-bottom:0;">
+                                    <i class="fas fa-truck"></i>
+                                </div>
+                                <div>
+                                    <h6 style="margin:0 0 2px;font-size:0.88rem;">Delivery</h6>
+                                    <p style="margin:0;font-size:0.74rem;color:rgba(0,0,0,0.42);">Item delivered to your location</p>
+                                </div>
+                            </div>
+                        </label>
+                        <label class="rq-type-card" id="rm-pickup" onclick="selectReceivingMethod('pickup',this)" style="cursor:pointer;">
+                            <input type="radio" name="receiving_method" value="pickup">
+                            <div class="rq-type-check"><i class="fas fa-check"></i></div>
+                            <div style="display:flex;align-items:center;gap:10px;">
+                                <div class="rq-type-icon" style="color:#15803d;width:32px;height:32px;min-width:32px;font-size:1rem;margin-bottom:0;">
+                                    <i class="fas fa-walking"></i>
+                                </div>
+                                <div>
+                                    <h6 style="margin:0 0 2px;font-size:0.88rem;">Pickup</h6>
+                                    <p style="margin:0;font-size:0.74rem;color:rgba(0,0,0,0.42);">Pick up the item yourself</p>
+                                </div>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <hr class="rq-divider">
+                <input type="hidden" id="items_json" name="items_json">
+                <div class="d-flex gap-2 flex-wrap">
+                    <button type="submit" class="btn rq-submit-btn">
+                        <i class="fas fa-paper-plane me-2"></i>Submit Request
+                    </button>
+                    <a href="dashboard.php" class="btn rq-cancel-btn">
+                        <i class="fas fa-times me-1"></i> Cancel
+                    </a>
+                </div>
+            </form>
+            </div><!-- /.rq-form-body -->
+        </div><!-- /.rq-form-card -->
+
+        <!-- Summary Sidebar -->
+        <div class="rq-summary-card">
+            <div class="rq-summary-head">
+                <div class="rq-summary-head-title"><i class="fas fa-clipboard-list me-2"></i>Request Summary</div>
+                <div class="rq-summary-head-sub">Preview before submitting</div>
+            </div>
+            <div class="rq-summary-body">
+                <div class="rq-summary-row">
+                    <div class="rq-summary-icon"><i class="fas fa-tag"></i></div>
+                    <div>
+                        <div class="rq-summary-label">Type</div>
+                        <div class="rq-summary-val" id="sum_type"><?php echo termLabel("Borrow"); ?> Item</div>
+                    </div>
+                </div>
+                <div class="rq-summary-row">
+                    <div class="rq-summary-icon"><i class="fas fa-bolt"></i></div>
+                    <div>
+                        <div class="rq-summary-label">Priority</div>
+                        <div class="rq-summary-val" id="sum_urgency">Medium</div>
+                    </div>
+                </div>
+                <div class="rq-summary-row" style="flex-direction:column;align-items:flex-start;gap:6px;">
+                    <div style="display:flex;align-items:center;gap:6px;width:100%;">
+                        <div class="rq-summary-icon"><i class="fas fa-list-ul"></i></div>
+                        <div style="flex:1;">
+                            <div class="rq-summary-label">Items</div>
+                            <div class="rq-summary-val" id="sum_items_count"><span class="rq-summary-empty">None</span></div>
+                        </div>
+                    </div>
+                    <div id="sum_items_list" style="width:100%;padding-left:34px;"></div>
+                </div>
+                <div class="rq-summary-tip">
+                    <i class="fas fa-info-circle me-1" style="color:var(--red);"></i>
+                    Requests are reviewed by the admin. You will be notified once a decision is made.
+                </div>
+            </div>
+
+            <!-- Item Availability Calendar -->
+            <div id="iac-wrap" class="iac-outer" style="display:none;">
+                <div id="iac-status-bar" class="iac-bar"></div>
+                <div class="iac-cal-header">
+                    <div class="iac-cal-title">
+                        <i class="fas fa-calendar-days"></i> Availability
+                    </div>
+                    <div class="iac-cal-nav" id="iac-nav"></div>
+                </div>
+                <div class="iac-cal-panel">
+                    <div id="iac-cal-grid"></div>
+                </div>
+                <div class="iac-legend">
+                    <span class="iac-leg-item"><span class="iac-leg-dot" style="background:#fee2e2;border:1px solid #fca5a5;"></span>Unavailable</span>
+                    <span class="iac-leg-item"><span class="iac-leg-dot" style="background:#fef3c7;border:1px solid #fbbf24;"></span>Returns</span>
+                    <span class="iac-leg-item"><span class="iac-leg-dot" style="background:#fecaca;border:1px solid #f87171;"></span>Overdue</span>
+                    <span class="iac-leg-item"><span class="iac-leg-dot" style="background:#dcfce7;border:1px solid #86efac;"></span>Available</span>
+                </div>
+            </div>
+        </div>
+
+    </div><!-- /.rq-layout -->
+</div>
+</div>
+
+<script>
+/* ── Type selection ── */
+// Borrow/Request wording here follows the same site-wide terminology switch
+// as everything server-rendered — this object is pure JS otherwise, so
+// without echoing termLabel() into it, the form header/summary stayed stuck
+// in the default wording no matter what the switch was set to.
+const typeConfig = {
+    borrow:  { title:'<?php echo termLabel("Borrow"); ?> Item', sub:'Fill in the details for your <?php echo strtolower(termLabel("Borrow")); ?> request', icon:'fa-hand-holding', bg:'rgba(59,130,246,0.12)',  color:'#1d4ed8', label:'<?php echo termLabel("Borrow"); ?> Item' },
+    item:    { title:'<?php echo termLabel("Request Item"); ?>', sub:'Specify the item you need procured', icon:'fa-shopping-cart',bg:'rgba(34,197,94,0.12)',   color:'#15803d', label:'<?php echo termLabel("Request Item"); ?>' },
+    service: { title:'Request Service',  sub:'Describe the maintenance or repair needed',          icon:'fa-tools',        bg:'rgba(245,158,11,0.12)',  color:'#b45309', label:'Request Service'  },
+};
+
+function selectType(card, type) {
+    if (cart.length > 0) { cart = []; renderCart(); hideCartError(); }
+    document.querySelectorAll('.rq-type-card').forEach(c => c.classList.remove('selected'));
+    card.classList.add('selected');
+    document.getElementById('request_type_hidden').value = type;
+    const cfg = typeConfig[type];
+    document.getElementById('formHeadIcon').style.background = '';
+    document.getElementById('formHeadIcon').style.color      = cfg.color;
+    document.getElementById('formHeadIcon').innerHTML = '<i class="fas ' + cfg.icon + '"></i>';
+    document.getElementById('formHeadTitle').textContent = cfg.title;
+    document.getElementById('formHeadSub').textContent   = cfg.sub;
+    updateRequestType(type);
+    updateSummary();
+}
+
+function selectUrgency(pill, selectedClass) {
+    document.querySelectorAll('.urgency-pill').forEach(p => {
+        p.classList.remove('selected-low','selected-medium','selected-high','selected-critical');
+    });
+    pill.classList.add(selectedClass);
+    pill.querySelector('input[type=radio]').checked = true;
+    updateSummary();
+}
+
+function updateRequestType(type) {
+    ['borrow_fields','item_fields','service_fields'].forEach(id => {
+        document.getElementById(id).style.display = 'none';
+    });
+    // Hide availability calendar whenever request type changes
+    var iacWrap = document.getElementById('iac-wrap');
+    if (iacWrap) iacWrap.style.display = 'none';
+    ['borrow_catalog_select','expected_return_date','borrow_quantity','item_description','quantity','service_subject','service_type','service_description'].forEach(id => {
+        document.getElementById(id).removeAttribute('required');
+    });
+    // Hide receiving method for service requests (not applicable)
+    document.getElementById('receiving_method_section').style.display = type === 'service' ? 'none' : 'block';
+    if (type === 'borrow') {
+        document.getElementById('borrow_fields').style.display = 'block';
+        document.getElementById('borrow_catalog_select').setAttribute('required','required');
+        document.getElementById('expected_return_date').setAttribute('required','required');
+        document.getElementById('borrow_quantity').setAttribute('required','required');
+    } else if (type === 'item') {
+        document.getElementById('item_fields').style.display = 'block';
+        document.getElementById('item_description').setAttribute('required','required');
+        document.getElementById('quantity').setAttribute('required','required');
+    } else if (type === 'service') {
+        document.getElementById('service_fields').style.display = 'block';
+        document.getElementById('service_subject').setAttribute('required','required');
+        document.getElementById('service_type').setAttribute('required','required');
+        document.getElementById('service_description').setAttribute('required','required');
+    }
+}
+
+function selectReceivingMethod(method, el) {
+    document.getElementById('rm-delivery').classList.remove('selected');
+    document.getElementById('rm-pickup').classList.remove('selected');
+    el.classList.add('selected');
+    el.querySelector('input[type=radio]').checked = true;
+}
+
+/* ── Catalog selects ── */
+/* ── Borrow item shop ── */
+function selectBorrowCard(card) {
+    document.querySelectorAll('.bshop-card').forEach(function(c) { c.classList.remove('bshop-selected'); });
+    card.classList.add('bshop-selected');
+    var select = document.getElementById('borrow_catalog_select');
+    select.value = card.getAttribute('data-value');
+    handleCatalogChange(select);
+    updateSummary();
+}
+
+// Borrow catalog pagination, applied on top of whatever the search box/
+// category pills currently match. Re-filtering always jumps back to page 1
+// — otherwise switching category could land you on a now out-of-range page.
+// Page size is admin-configurable (Settings > System Settings > Borrow
+// Catalog Pagination), not hardcoded.
+var BSHOP_PAGE_SIZE = <?php echo max(4, min(60, (int)getAppSetting('borrow_catalog_page_size', '12'))); ?>;
+
+function filterShopItems(btn) {
+    if (btn) {
+        // Scoped to #bshop-cats specifically — the Item Request shop below
+        // reuses the same .bshop-cat class for its own, separate pills, and
+        // toggling every .bshop-cat on the page was clearing the OTHER
+        // shop's active pill too.
+        document.querySelectorAll('#bshop-cats .bshop-cat').forEach(function(b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+    }
+    var activeCat = '';
+    var activeBtn = document.querySelector('#bshop-cats .bshop-cat.active');
+    if (activeBtn) activeCat = activeBtn.getAttribute('data-cat') || '';
+    var search = (document.getElementById('bshop-search').value || '').toLowerCase().trim();
+    var matches = [];
+    document.querySelectorAll('#bshop-grid .bshop-card').forEach(function(card) {
+        var cat = card.getAttribute('data-category') || '';
+        var name = (card.querySelector('.bshop-name') ? card.querySelector('.bshop-name').textContent : '').toLowerCase();
+        var desc = (card.querySelector('.bshop-desc') ? card.querySelector('.bshop-desc').textContent : '').toLowerCase();
+        var catMatch = !activeCat || cat === activeCat;
+        var searchMatch = !search || name.indexOf(search) !== -1 || desc.indexOf(search) !== -1;
+        if (catMatch && searchMatch) matches.push(card);
+        else card.style.display = 'none';
+    });
+    renderBshopPage(matches, 1);
+}
+
+// Shows just the current page's slice of [matches] (cards that already
+// passed the search/category filter above), hides the rest, and rebuilds the
+// pager underneath the grid.
+function renderBshopPage(matches, page) {
+    var totalPages = Math.max(1, Math.ceil(matches.length / BSHOP_PAGE_SIZE));
+    page = Math.min(Math.max(1, page), totalPages);
+    var start = (page - 1) * BSHOP_PAGE_SIZE;
+    document.querySelectorAll('#bshop-grid .bshop-card').forEach(function(card) { card.style.display = 'none'; });
+    matches.slice(start, start + BSHOP_PAGE_SIZE).forEach(function(card) { card.style.display = ''; });
+
+    var emptyEl = document.getElementById('bshop-empty');
+    if (emptyEl) emptyEl.style.display = matches.length === 0 ? 'flex' : 'none';
+
+    var pagerEl = document.getElementById('bshop-pagination');
+    if (!pagerEl) return;
+    if (totalPages <= 1) { pagerEl.innerHTML = ''; return; }
+    var html = '<button type="button" ' + (page === 1 ? 'disabled' : 'onclick="filterShopItemsPage(' + (page - 1) + ')"') + '><i class="fas fa-chevron-left"></i></button>';
+    for (var i = 1; i <= totalPages; i++) {
+        html += '<button type="button" class="' + (i === page ? 'active' : '') + '" onclick="filterShopItemsPage(' + i + ')">' + i + '</button>';
+    }
+    html += '<button type="button" ' + (page === totalPages ? 'disabled' : 'onclick="filterShopItemsPage(' + (page + 1) + ')"') + '><i class="fas fa-chevron-right"></i></button>';
+    pagerEl.innerHTML = html;
+}
+
+// Re-runs the current search/category filter, then jumps straight to [page]
+// instead of resetting to page 1 — used by the pager's own buttons.
+function filterShopItemsPage(page) {
+    var activeBtn = document.querySelector('#bshop-cats .bshop-cat.active');
+    var activeCat = activeBtn ? (activeBtn.getAttribute('data-cat') || '') : '';
+    var search = (document.getElementById('bshop-search').value || '').toLowerCase().trim();
+    var matches = [];
+    document.querySelectorAll('#bshop-grid .bshop-card').forEach(function(card) {
+        var cat = card.getAttribute('data-category') || '';
+        var name = (card.querySelector('.bshop-name') ? card.querySelector('.bshop-name').textContent : '').toLowerCase();
+        var desc = (card.querySelector('.bshop-desc') ? card.querySelector('.bshop-desc').textContent : '').toLowerCase();
+        var catMatch = !activeCat || cat === activeCat;
+        var searchMatch = !search || name.indexOf(search) !== -1 || desc.indexOf(search) !== -1;
+        if (catMatch && searchMatch) matches.push(card);
+    });
+    renderBshopPage(matches, page);
+    document.getElementById('bshop-pagination').scrollIntoView({behavior: 'smooth', block: 'nearest'});
+}
+
+// Re-clamps a quantity input to its own max attribute on every keystroke —
+// handleCatalogChange()/selectItemReqCard() only clamp at the moment an item
+// is selected, so typing a bigger number into the field afterwards (instead
+// of using the spinner arrows) slipped straight through with no client-side
+// check at all. The server still caps the actual request to real stock
+// either way, but the cart/summary should never show more than what could
+// ever be requested.
+function clampQtyInput(input) {
+    var max = parseInt(input.getAttribute('max'));
+    if (!isNaN(max) && parseInt(input.value) > max) input.value = max;
+    var min = parseInt(input.getAttribute('min')) || 1;
+    if (input.value !== '' && parseInt(input.value) < min) input.value = min;
+}
+
+function handleCatalogChange(select) {
+    select.setAttribute('required','required');
+
+    // Cap quantity input to available stock
+    var qtyInput = document.getElementById('borrow_quantity');
+    var opt = select.options[select.selectedIndex];
+    var available = parseInt(opt && opt.getAttribute('data-available')) || 1;
+    if (select.value) {
+        qtyInput.max = available;
+        qtyInput.title = 'Maximum available: ' + available;
+        if (parseInt(qtyInput.value) > available) qtyInput.value = available;
+        if (available < 1) qtyInput.value = 0;
+    } else {
+        qtyInput.removeAttribute('max');
+        qtyInput.removeAttribute('title');
+    }
+
+    renderItemAvailCal(select);
+}
+
+/* ── Item Availability Calendar ── */
+var itemAvailData   = <?php echo $item_avail_json; ?>;
+var iacCurrentId      = null;
+var iacCurrentRecords = [];   // aggregated records for the selected item group
+var iacViewDate       = new Date(); iacViewDate.setDate(1);
+var IAC_MONTHS      = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+var IAC_DAYS        = ['S','M','T','W','T','F','S'];
+
+function iacPad(n) { return String(n).padStart(2,'0'); }
+function iacDS(y, m, d) { return y + '-' + iacPad(m+1) + '-' + iacPad(d); }
+
+function renderItemAvailCal(select) {
+    var wrap = document.getElementById('iac-wrap');
+    if (!select.value) {
+        wrap.style.display = 'none';
+        iacCurrentId = null;
+        return;
+    }
+    var opt      = select.options[select.selectedIndex];
+    var itemId   = parseInt(opt.getAttribute('data-item-id'));
+    var totalQty = parseInt(opt.getAttribute('data-quantity')) || 0;
+    if (!itemId) {
+        wrap.style.display = 'none';
+        iacCurrentId = null;
+        return;
+    }
+    iacCurrentId = itemId;
+
+    // Aggregate return records across ALL units in the group
+    var allUnitIds = [];
+    try { allUnitIds = JSON.parse(opt.getAttribute('data-all-unit-ids') || '[]'); } catch(e) {}
+    if (!allUnitIds.length) allUnitIds = [itemId];
+    var records = [];
+    allUnitIds.forEach(function(uid) {
+        (itemAvailData[uid] || []).forEach(function(r) { records.push(r); });
+    });
+    // Deduplicate by return_date
+    var seen = {};
+    records = records.filter(function(r) {
+        if (!r.return_date || seen[r.return_date]) return false;
+        seen[r.return_date] = true;
+        return true;
+    });
+
+    var bar = document.getElementById('iac-status-bar');
+
+    // Sort records by return date ascending
+    records = records.slice().sort(function(a, b) { return a.return_date.localeCompare(b.return_date); });
+
+    if (records.length === 0) {
+        // Nothing borrowed/requested right now — still show the calendar so the
+        // user can see availability at a glance, just with an all-clear banner.
+        bar.innerHTML = '<div class="iac-bar-top">'
+                      + '<i class="fas fa-circle-check"></i>'
+                      + '<span><strong>All ' + totalQty + ' unit(s) currently available</strong></span>'
+                      + '</div>';
+        bar.className = 'iac-bar';
+        iacViewDate = new Date(); iacViewDate.setDate(1);
+    } else {
+        var overdueCount = records.filter(function(r) { return r.is_overdue; }).length;
+        var retChips = records.map(function(r) {
+            var d = new Date(r.return_date + 'T00:00:00');
+            var lbl = d.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'});
+            var cls = 'iac-ret-chip' + (r.is_overdue ? ' iac-ret-chip-overdue' : '');
+            return '<span class="' + cls + '">' + lbl + (r.is_overdue ? ' — Overdue' : '') + '</span>';
+        }).join('');
+        bar.innerHTML = '<div class="iac-bar-top">'
+                      + '<i class="fas ' + (overdueCount ? 'fa-triangle-exclamation' : 'fa-clock') + '"></i>'
+                      + '<span><strong>' + records.length + ' of ' + totalQty + ' units requested or borrowed</strong>'
+                      + (overdueCount ? ' <span style="color:#b91c1c;">— ' + overdueCount + ' overdue</span>' : '')
+                      + '</span>'
+                      + '</div>'
+                      + '<div class="iac-bar-chips"><span class="iac-bar-chips-label">Expected returns:</span>' + retChips + '</div>';
+        bar.className = 'iac-bar iac-bar-borrowed' + (overdueCount ? ' iac-bar-overdue' : '');
+
+        // Navigate to the month of the earliest return
+        var earliest = new Date(records[0].return_date + 'T00:00:00');
+        iacViewDate  = new Date(earliest.getFullYear(), earliest.getMonth(), 1);
+    }
+
+    iacCurrentRecords = records;   // cache for iacNav month-navigation
+    wrap.style.display = 'block';
+    renderIacGrid(records);
+}
+
+function renderIacGrid(records) {
+    var y  = iacViewDate.getFullYear(), m = iacViewDate.getMonth();
+    var now = new Date();
+    var todayStr = iacDS(now.getFullYear(), now.getMonth(), now.getDate());
+    var todayMid = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    var firstDay = new Date(y, m, 1).getDay();
+    var daysInMo = new Date(y, m+1, 0).getDate();
+
+    // Build a Set of all return date strings, and which of those are overdue
+    // (expected return date already passed, still not returned).
+    var retStrSet = {};
+    var overdueStrSet = {};
+    var lastRetDate = null;
+    (records || []).forEach(function(r) {
+        retStrSet[r.return_date] = true;
+        if (r.is_overdue) overdueStrSet[r.return_date] = true;
+        var d = new Date(r.return_date + 'T00:00:00');
+        if (!lastRetDate || d > lastRetDate) lastRetDate = d;
+    });
+
+    document.getElementById('iac-nav').innerHTML =
+        '<button onclick="iacNav(-1)"><i class="fas fa-chevron-left"></i></button>' +
+        '<span>' + IAC_MONTHS[m] + ' ' + y + '</span>' +
+        '<button onclick="iacNav(1)"><i class="fas fa-chevron-right"></i></button>';
+
+    var h = '<div class="iac-grid">';
+    IAC_DAYS.forEach(function(d) { h += '<div class="iac-dow">' + d + '</div>'; });
+    for (var i = 0; i < firstDay; i++) h += '<div class="iac-cell"></div>';
+
+    for (var d = 1; d <= daysInMo; d++) {
+        var ds       = iacDS(y, m, d);
+        var cellDate = new Date(y, m, d);
+        var isToday  = ds === todayStr;
+        var isPast   = cellDate < todayMid;
+        var cls      = 'iac-cell';
+
+        if (overdueStrSet[ds]) {
+            cls += ' iac-overdue';
+        } else if (retStrSet[ds]) {
+            cls += ' iac-returns';
+        } else if (isPast) {
+            cls += ' iac-past';
+        } else if (lastRetDate && cellDate < lastRetDate) {
+            cls += ' iac-unavail';
+        } else if (lastRetDate && cellDate > lastRetDate) {
+            cls += ' iac-avail';
+        }
+        if (isToday) cls += ' iac-today';
+
+        h += '<div class="' + cls + '">' + d + '</div>';
+    }
+    h += '</div>';
+
+    document.getElementById('iac-cal-grid').innerHTML = h;
+}
+
+window.iacNav = function(dir) {
+    iacViewDate = new Date(iacViewDate.getFullYear(), iacViewDate.getMonth() + dir, 1);
+    renderIacGrid(iacCurrentRecords);
+};
+function selectItemReqCard(card) {
+    document.querySelectorAll('#ishop-grid .bshop-card').forEach(function(c) { c.classList.remove('bshop-selected'); });
+    card.classList.add('bshop-selected');
+    var select = document.getElementById('item_description');
+    select.value = card.getAttribute('data-value');
+    handleItemCatalogChange(select);
+    var total = parseInt(card.getAttribute('data-total')) || 0;
+    var qtyInput = document.getElementById('quantity');
+    if (total > 0 && card.getAttribute('data-value') !== '__custom__') {
+        qtyInput.max = total;
+        qtyInput.title = 'Maximum available: ' + total;
+        if (parseInt(qtyInput.value) > total) qtyInput.value = total;
+    } else {
+        qtyInput.removeAttribute('max');
+        qtyInput.removeAttribute('title');
+    }
+    updateSummary();
+}
+
+// Item Request catalog pagination — same scheme as the borrow shop above
+// (filterShopItems()/renderBshopPage()), reusing the same admin-configurable
+// page size. The "Other / Custom" card is pinned outside pagination (always
+// shown first, on every page) rather than competing for a page slot.
+function filterItemShop(btn) {
+    if (btn) {
+        document.querySelectorAll('#ishop-cats .bshop-cat').forEach(function(b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+    }
+    var activeCat = '';
+    var activeBtn = document.querySelector('#ishop-cats .bshop-cat.active');
+    if (activeBtn) activeCat = activeBtn.getAttribute('data-cat') || '';
+    var search = (document.getElementById('ishop-search').value || '').toLowerCase().trim();
+
+    var customCard = document.querySelector('#ishop-grid .bshop-card-custom');
+    if (customCard) {
+        var custName = (customCard.querySelector('.bshop-name') ? customCard.querySelector('.bshop-name').textContent : '').toLowerCase();
+        customCard.style.display = (!search || custName.indexOf(search) !== -1) ? '' : 'none';
+    }
+
+    var matches = [];
+    document.querySelectorAll('#ishop-grid .bshop-card:not(.bshop-card-custom)').forEach(function(card) {
+        var cat = card.getAttribute('data-category') || '';
+        var name = (card.querySelector('.bshop-name') ? card.querySelector('.bshop-name').textContent : '').toLowerCase();
+        var catMatch = !activeCat || cat === activeCat;
+        var searchMatch = !search || name.indexOf(search) !== -1;
+        if (catMatch && searchMatch) matches.push(card);
+        else card.style.display = 'none';
+    });
+    renderIshopPage(matches, 1);
+}
+
+// Shows just the current page's slice of [matches], hides the rest, and
+// rebuilds the pager underneath the grid.
+function renderIshopPage(matches, page) {
+    var totalPages = Math.max(1, Math.ceil(matches.length / BSHOP_PAGE_SIZE));
+    page = Math.min(Math.max(1, page), totalPages);
+    var start = (page - 1) * BSHOP_PAGE_SIZE;
+    document.querySelectorAll('#ishop-grid .bshop-card:not(.bshop-card-custom)').forEach(function(card) { card.style.display = 'none'; });
+    matches.slice(start, start + BSHOP_PAGE_SIZE).forEach(function(card) { card.style.display = ''; });
+
+    var customCard = document.querySelector('#ishop-grid .bshop-card-custom');
+    var customVisible = customCard && customCard.style.display !== 'none';
+    var emptyEl = document.getElementById('ishop-empty');
+    if (emptyEl) emptyEl.style.display = (matches.length === 0 && !customVisible) ? 'flex' : 'none';
+
+    var pagerEl = document.getElementById('ishop-pagination');
+    if (!pagerEl) return;
+    if (totalPages <= 1) { pagerEl.innerHTML = ''; return; }
+    var html = '<button type="button" ' + (page === 1 ? 'disabled' : 'onclick="filterItemShopPage(' + (page - 1) + ')"') + '><i class="fas fa-chevron-left"></i></button>';
+    for (var i = 1; i <= totalPages; i++) {
+        html += '<button type="button" class="' + (i === page ? 'active' : '') + '" onclick="filterItemShopPage(' + i + ')">' + i + '</button>';
+    }
+    html += '<button type="button" ' + (page === totalPages ? 'disabled' : 'onclick="filterItemShopPage(' + (page + 1) + ')"') + '><i class="fas fa-chevron-right"></i></button>';
+    pagerEl.innerHTML = html;
+}
+
+// Re-runs the current search/category filter, then jumps straight to [page]
+// instead of resetting to page 1 — used by the pager's own buttons.
+function filterItemShopPage(page) {
+    var activeBtn = document.querySelector('#ishop-cats .bshop-cat.active');
+    var activeCat = activeBtn ? (activeBtn.getAttribute('data-cat') || '') : '';
+    var search = (document.getElementById('ishop-search').value || '').toLowerCase().trim();
+    var matches = [];
+    document.querySelectorAll('#ishop-grid .bshop-card:not(.bshop-card-custom)').forEach(function(card) {
+        var cat = card.getAttribute('data-category') || '';
+        var name = (card.querySelector('.bshop-name') ? card.querySelector('.bshop-name').textContent : '').toLowerCase();
+        var catMatch = !activeCat || cat === activeCat;
+        var searchMatch = !search || name.indexOf(search) !== -1;
+        if (catMatch && searchMatch) matches.push(card);
+    });
+    renderIshopPage(matches, page);
+    document.getElementById('ishop-pagination').scrollIntoView({behavior: 'smooth', block: 'nearest'});
+}
+
+function selectServiceCard(card) {
+    document.querySelectorAll('#sshop-grid .bshop-card').forEach(function(c) { c.classList.remove('bshop-selected'); });
+    card.classList.add('bshop-selected');
+    var select = document.getElementById('item_id');
+    select.value = card.getAttribute('data-value');
+    updateSummary();
+}
+
+function filterServiceShop(btn) {
+    if (btn) {
+        document.querySelectorAll('#sshop-cats .bshop-cat').forEach(function(b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+    }
+    var activeCat = '';
+    var activeBtn = document.querySelector('#sshop-cats .bshop-cat.active');
+    if (activeBtn) activeCat = activeBtn.getAttribute('data-cat') || '';
+    var search = (document.getElementById('sshop-search').value || '').toLowerCase().trim();
+    var visible = 0;
+    document.querySelectorAll('#sshop-grid .bshop-card').forEach(function(card) {
+        var cat = card.getAttribute('data-category') || '';
+        var name = (card.querySelector('.bshop-name') ? card.querySelector('.bshop-name').textContent : '').toLowerCase();
+        var catMatch = !activeCat || cat === activeCat;
+        var searchMatch = !search || name.indexOf(search) !== -1;
+        var show = catMatch && searchMatch;
+        card.style.display = show ? '' : 'none';
+        if (show) visible++;
+    });
+    var emptyEl = document.getElementById('sshop-empty');
+    if (emptyEl) emptyEl.style.display = visible === 0 ? 'flex' : 'none';
+}
+
+function handleItemCatalogChange(select) {
+    var customWrap  = document.getElementById('custom_item_req_wrap');
+    var customInput = document.getElementById('custom_item_req_name');
+    var descWrap    = document.getElementById('item_desc_display_wrap');
+    var descInput   = document.getElementById('item_desc_display');
+    var descText    = document.getElementById('item_desc_display_text');
+    if (select.value === '__custom__') {
+        customWrap.style.display = 'block'; customInput.setAttribute('required','required');
+        descWrap.style.display = 'none'; descInput.value = '';
+        select.removeAttribute('required');
+    } else if (select.value !== '') {
+        customWrap.style.display = 'none'; customInput.removeAttribute('required'); customInput.value = '';
+        select.setAttribute('required','required');
+        var desc = select.options[select.selectedIndex].getAttribute('data-desc');
+        if (desc) { descInput.value = desc; descText.textContent = desc; descWrap.style.display = 'block'; }
+        else       { descWrap.style.display = 'none'; descInput.value = ''; }
+    } else {
+        customWrap.style.display = 'none'; customInput.removeAttribute('required'); customInput.value = '';
+        descWrap.style.display = 'none'; descInput.value = '';
+    }
+}
+
+/* ── Cart ── */
+var cart = [];
+
+// String comparison works here since both sides are YYYY-MM-DD.
+function isPastDate(dateStr) {
+    if (!dateStr) return false;
+    var now = new Date();
+    var todayStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+    return dateStr < todayStr;
+}
+
+function addToCart() {
+    var type = document.getElementById('request_type_hidden').value;
+    var entry = {};
+    if (type === 'borrow') {
+        var sel = document.getElementById('borrow_catalog_select');
+        var name = sel.value;
+        if (!name) { showCartError('Please select an item to <?php echo strtolower(termLabel("Borrow")); ?>.'); return; }
+        var rd = document.getElementById('expected_return_date').value;
+        if (!rd) { showCartError('Please enter the expected return date.'); return; }
+        if (isPastDate(rd)) { showCartError('Expected return date cannot be in the past.'); return; }
+        var qty = parseInt(document.getElementById('borrow_quantity').value) || 1;
+        var reason = document.getElementById('reason').value.trim();
+        var borrowCard = document.querySelector('#bshop-grid .bshop-card.bshop-selected');
+        var unitIdsRaw;
+        if (borrowCard) {
+            unitIdsRaw = borrowCard.getAttribute('data-unit-ids') || '[]';
+        } else {
+            // Fall back to the selected option's data-unit-ids
+            var selOpt = (sel.selectedIndex >= 0) ? sel.options[sel.selectedIndex] : null;
+            unitIdsRaw = (selOpt && selOpt.getAttribute('data-unit-ids')) || '[]';
+        }
+        var unitIds = [];
+        try { unitIds = JSON.parse(unitIdsRaw); } catch(e) { unitIds = []; }
+        var inventoryId = unitIds.length > 0 ? unitIds[0] : (borrowCard ? (borrowCard.getAttribute('data-item-id') || '') : '');
+        var selectedUnitIds = unitIds.slice(0, qty);
+        var dateNeeded1 = document.getElementById('borrow_date_needed').value;
+        if (isPastDate(dateNeeded1)) { showCartError('Date needed cannot be in the past.'); return; }
+        entry = { type:'borrow', name:name, inventory_id:inventoryId, unit_ids:selectedUnitIds, qty:qty, return_date:rd, reason:reason, date_needed:dateNeeded1 };
+    } else if (type === 'item') {
+        var sel2 = document.getElementById('item_description');
+        var name2 = (sel2.value && sel2.value !== '__custom__') ? sel2.value : document.getElementById('custom_item_req_name').value.trim();
+        if (!name2) { showCartError('Please select or enter an item name.'); return; }
+        var qty2 = parseInt(document.getElementById('quantity').value) || 1;
+        var reason2 = document.getElementById('item_reason').value.trim();
+        var itemCard = document.querySelector('#ishop-grid .bshop-card.bshop-selected');
+        var itemUnitIdsRaw = itemCard ? (itemCard.getAttribute('data-unit-ids') || '[]') : '[]';
+        var itemUnitIds = [];
+        try { itemUnitIds = JSON.parse(itemUnitIdsRaw); } catch(e) { itemUnitIds = []; }
+        var itemFirstUnitId = itemCard ? (itemCard.getAttribute('data-first-unit-id') || '') : '';
+        var dateNeeded2 = document.getElementById('item_date_needed').value;
+        if (isPastDate(dateNeeded2)) { showCartError('Date needed cannot be in the past.'); return; }
+        entry = { type:'item', name:name2, qty:qty2, reason:reason2, inventory_id:itemFirstUnitId, unit_ids:itemUnitIds, date_needed:dateNeeded2 };
+    } else {
+        var svcSubject = document.getElementById('service_subject').value.trim();
+        if (!svcSubject) { showCartError('Please describe what needs service.'); return; }
+        var svcType = document.getElementById('service_type').value;
+        if (!svcType) { showCartError('Please select a service type.'); return; }
+        var svcDesc = document.getElementById('service_description').value.trim();
+        if (!svcDesc) { showCartError('Please describe the service needed.'); return; }
+        var dateNeeded3 = document.getElementById('service_date_needed').value;
+        if (isPastDate(dateNeeded3)) { showCartError('Date needed cannot be in the past.'); return; }
+        entry = { type:'service', name:svcSubject, service_type:svcType, description:svcDesc, date_needed:dateNeeded3 };
+    }
+    cart.push(entry);
+    renderCart();
+    resetStaging(type);
+    updateSummary();
+    hideCartError();
+}
+
+function removeFromCart(idx) {
+    cart.splice(idx, 1);
+    renderCart();
+    updateSummary();
+}
+
+function renderCart() {
+    var listEl = document.getElementById('rq-cart-list');
+    var badge  = document.getElementById('cart-count-badge');
+    if (badge) badge.textContent = cart.length;
+    if (cart.length === 0) {
+        listEl.innerHTML = '<div class="rq-cart-empty"><i class="fas fa-inbox" style="font-size:1.5rem;display:block;margin-bottom:8px;opacity:0.22;"></i>No items added yet. Fill in the details above and click <strong>Add to List</strong>.</div>';
+        return;
+    }
+    var svcLabels = { repair:'Repair', maintenance:'Maintenance', inspection:'Inspection', cleaning:'Cleaning', other:'Other' };
+    var html = '';
+    cart.forEach(function(e, i) {
+        var meta = [];
+        if (e.qty && e.qty > 1) meta.push('Qty: ' + e.qty);
+        if (e.date_needed) meta.push('Needed: ' + new Date(e.date_needed + 'T00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}));
+        if (e.return_date) meta.push('Return: ' + new Date(e.return_date + 'T00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}));
+        if (e.service_type) meta.push(svcLabels[e.service_type] || e.service_type);
+        if (e.description)  meta.push(e.description.substring(0,40) + (e.description.length > 40 ? '…' : ''));
+        if (e.reason)       meta.push(e.reason.substring(0,40) + (e.reason.length > 40 ? '…' : ''));
+        html += '<div class="rq-cart-item">' +
+            '<div class="rq-cart-item-num">' + (i+1) + '</div>' +
+            '<div class="rq-cart-item-body">' +
+                '<div class="rq-cart-item-name">' + escHtml(e.name) + '</div>' +
+                (meta.length ? '<div class="rq-cart-item-meta">' + meta.map(function(m){ return '<span>' + escHtml(m) + '</span>'; }).join(' · ') + '</div>' : '') +
+            '</div>' +
+            '<button type="button" class="rq-cart-remove" onclick="removeFromCart(' + i + ')"><i class="fas fa-times"></i></button>' +
+        '</div>';
+    });
+    listEl.innerHTML = html;
+}
+
+function resetStaging(type) {
+    if (type === 'borrow') {
+        document.getElementById('borrow_catalog_select').value = '';
+        document.querySelectorAll('.bshop-card').forEach(function(c) { c.classList.remove('bshop-selected'); });
+        document.getElementById('borrow_date_needed').value = '';
+        document.getElementById('expected_return_date').value = '';
+        document.getElementById('borrow_quantity').value = 1;
+        document.getElementById('reason').value = '';
+        var iacWrap = document.getElementById('iac-wrap');
+        if (iacWrap) iacWrap.style.display = 'none';
+    } else if (type === 'item') {
+        document.getElementById('item_description').value = '';
+        document.querySelectorAll('#ishop-grid .bshop-card').forEach(function(c) { c.classList.remove('bshop-selected'); });
+        document.getElementById('custom_item_req_name').value = '';
+        document.getElementById('custom_item_req_wrap').style.display = 'none';
+        document.getElementById('item_desc_display_wrap').style.display = 'none';
+        document.getElementById('quantity').value = 1;
+        document.getElementById('item_reason').value = '';
+        document.getElementById('item_date_needed').value = '';
+    } else {
+        document.getElementById('service_subject').value = '';
+        document.getElementById('service_type').value = '';
+        document.getElementById('service_description').value = '';
+        document.getElementById('service_date_needed').value = '';
+    }
+}
+
+function showCartError(msg) {
+    var el = document.getElementById('cart-error');
+    if (el) { el.textContent = msg; el.style.display = 'block'; el.scrollIntoView({behavior:'smooth',block:'nearest'}); }
+}
+function hideCartError() {
+    var el = document.getElementById('cart-error');
+    if (el) el.style.display = 'none';
+}
+function escHtml(str) {
+    var d = document.createElement('div'); d.textContent = String(str); return d.innerHTML;
+}
+
+/* ── Live summary ── */
+function updateSummary() {
+    var type    = document.getElementById('request_type_hidden').value;
+    var urgency = document.querySelector('input[name=urgency]:checked');
+    document.getElementById('sum_type').textContent    = typeConfig[type]?.label || '—';
+    document.getElementById('sum_urgency').textContent = urgency ? urgency.value.charAt(0).toUpperCase() + urgency.value.slice(1) : '—';
+
+    var sumItemsEl = document.getElementById('sum_items_list');
+    var sumCountEl = document.getElementById('sum_items_count');
+    if (sumCountEl) sumCountEl.textContent = cart.length ? cart.length + ' item' + (cart.length !== 1 ? 's' : '') : '—';
+    if (!sumItemsEl) return;
+
+    if (cart.length === 0) {
+        var stagingName = '';
+        if (type === 'borrow') {
+            var sel = document.getElementById('borrow_catalog_select');
+            stagingName = sel.value;
+        } else if (type === 'item') {
+            var sel2 = document.getElementById('item_description');
+            stagingName = (sel2.value && sel2.value !== '__custom__') ? sel2.value : document.getElementById('custom_item_req_name').value;
+        } else {
+            stagingName = document.getElementById('service_subject').value.trim();
+        }
+        sumItemsEl.innerHTML = stagingName
+            ? '<div class="rq-sum-preview-item"><span class="rq-sum-preview-num">?</span><span style="font-size:0.82rem;font-weight:600;">' + escHtml(stagingName) + '</span> <span style="font-size:0.72rem;color:rgba(0,0,0,0.35);">(not added)</span></div>'
+            : '<div style="font-size:0.75rem;color:rgba(0,0,0,0.28);font-style:italic;padding:2px 0;">Nothing staged yet</div>';
+    } else {
+        var previewHtml = '';
+        cart.forEach(function(e, i) {
+            previewHtml += '<div class="rq-sum-preview-item">' +
+                '<span class="rq-sum-preview-num">' + (i+1) + '</span>' +
+                '<span style="font-size:0.82rem;font-weight:600;">' + escHtml(e.name) + '</span>' +
+                (e.qty > 1 ? ' <span style="font-size:0.72rem;color:rgba(0,0,0,0.40);">×' + e.qty + '</span>' : '') +
+            '</div>';
+        });
+        sumItemsEl.innerHTML = previewHtml;
+    }
+}
+
+/* ── Form submit ── */
+document.getElementById('requestForm').addEventListener('submit', function(e) {
+    if (cart.length === 0) {
+        e.preventDefault();
+        showCartError('Please add at least one item to your request before submitting.');
+        document.getElementById('rq-cart-area').scrollIntoView({ behavior:'smooth', block:'center' });
+        return;
+    }
+    document.getElementById('items_json').value = JSON.stringify(cart);
+});
+
+// Init
+renderCart();
+updateSummary();
+filterShopItems(); // also paginates the borrow catalog from page 1 on first load
+filterItemShop();  // also paginates the item request catalog from page 1 on first load
+
+// Pre-select item from inventory page
+<?php if ($auto_fill_item && $auto_fill_type === 'item'): ?>
+    (function() {
+        // Request/acquire-only items were linked here with type=item — switch to the
+        // "Request Item" step and pre-select the matching card in that catalog instead
+        // of the Borrow one (which never lists request-only items).
+        selectType(document.getElementById('typeCardItem'), 'item');
+        var autoVal = '<?php echo htmlspecialchars($auto_fill_item, ENT_QUOTES); ?>';
+        var matchCard = null;
+        document.querySelectorAll('#ishop-grid .bshop-card').forEach(function(c) {
+            if (c.getAttribute('data-value') === autoVal) matchCard = c;
+        });
+        if (matchCard) {
+            // The catalog is paginated now — a deep-linked item could land on
+            // any page (same fix as the borrow shop's equivalent block below).
+            var allCards = Array.from(document.querySelectorAll('#ishop-grid .bshop-card:not(.bshop-card-custom)'));
+            var idx = allCards.indexOf(matchCard);
+            if (idx >= 0) filterItemShopPage(Math.floor(idx / BSHOP_PAGE_SIZE) + 1);
+            selectItemReqCard(matchCard);
+            setTimeout(function() { matchCard.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 150);
+        }
+    })();
+<?php elseif ($auto_fill_item): ?>
+    (function() {
+        var autoVal = '<?php echo htmlspecialchars($auto_fill_item, ENT_QUOTES); ?>';
+        // Select the matching shop card
+        var matchCard = null;
+        document.querySelectorAll('.bshop-card').forEach(function(c) {
+            if (c.getAttribute('data-value') === autoVal) matchCard = c;
+        });
+        if (matchCard) {
+            matchCard.classList.add('bshop-selected');
+            // The catalog is paginated now — a deep-linked item could land on
+            // any page, so jump straight to whichever one actually has it
+            // (nothing is filtered yet at this point, so DOM order == page order).
+            var allCards = Array.from(document.querySelectorAll('#bshop-grid .bshop-card'));
+            var idx = allCards.indexOf(matchCard);
+            if (idx >= 0) filterShopItemsPage(Math.floor(idx / BSHOP_PAGE_SIZE) + 1);
+            // Scroll card into view inside the grid
+            setTimeout(function() { matchCard.scrollIntoView({ block: 'nearest' }); }, 100);
+        }
+        // Sync hidden select and trigger logic
+        var selectElement = document.getElementById('borrow_catalog_select');
+        if (selectElement) {
+            selectElement.value = autoVal;
+            handleCatalogChange(selectElement);
+            var returnDateInput = document.getElementById('expected_return_date');
+            if (returnDateInput && !returnDateInput.value) {
+                var d = new Date(); d.setDate(d.getDate() + 7);
+                returnDateInput.value = d.getFullYear() + '-' +
+                    String(d.getMonth()+1).padStart(2,'0') + '-' +
+                    String(d.getDate()).padStart(2,'0');
+            }
+            updateSummary();
+            setTimeout(function() {
+                selectElement.closest('.rq-form-card').scrollIntoView({ behavior:'smooth', block:'center' });
+            }, 150);
+        }
+    })();
+<?php endif; ?>
+</script>
+
+<?php require_once dirname(__DIR__) . '/includes/footer.php'; ?>
